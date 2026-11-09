@@ -3,8 +3,11 @@
 // Weights: int8 with one scale per output row, stored per worker thread in the order the model reads them, on
 // huge pages, so decode is one sequential stream per thread. Activations: int16 with one scale per vector,
 // sized so a whole row's dot product fits an i32, so every matrix product is exact integer arithmetic
-// (`vpmaddwd`) followed by one float multiply. Attention runs in f32 on a K cache stored 8 positions per
-// block (64 x 8 floats) and a row-major V cache, one key/value head per thread.
+// (`vpmaddwd`) followed by one float multiply. A second byte per weight (w ~ s * (q + r / 256)) sits in a
+// separate plane and is read only where it matters: for the columns of a token's largest activations, and for
+// head rows whose logit is within HEAD_T of the best. Attention runs in f32 on half-precision K and V caches
+// (K stored 8 positions per block), one key/value head per thread. Results do not depend on the thread count
+// or on how many rows a pass handles.
 use std::arch::x86_64::*;
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -34,6 +37,71 @@ const fn qmax(k: usize) -> f32 {
 }
 const QM_H: f32 = qmax(H);
 const QM_FF: f32 = qmax(FF);
+
+// Second weight byte ("low plane"): w = scale * (q + r / 256). A token's largest activations carry most of
+// the energy of the vector, so the columns they multiply are the ones whose rounding error matters; those
+// few columns get the low byte added, the rest use q alone.
+const KMAX: usize = 64;
+const KSEL: [usize; 4] = [16, 0, 8, 64]; // most columns refined per token: q/k/v, o, gate/up, down
+const HEAD_T: f32 = 8.0; // head rows within this many nats of the best logit get the low byte
+
+#[derive(Clone, Copy)]
+struct Sel {
+    n: usize,
+    idx: [u16; KMAX],
+    val: [i16; KMAX],
+}
+const SEL0: Sel = Sel { n: 0, idx: [0; KMAX], val: [0; KMAX] };
+
+// Pick the largest-magnitude entries of x (k int16 values, |x| <= qm): everything at or above the lowest
+// power-of-two fraction of qm that keeps the count within kmax.
+#[inline(always)]
+unsafe fn select(x: *const i16, k: usize, qm: i32, kmax: usize, sel: *mut Sel) {
+    let sel = &mut *sel;
+    sel.n = 0;
+    if kmax == 0 {
+        return;
+    }
+    const NTH: usize = 12;
+    let mut th = [_mm256_setzero_si256(); NTH];
+    for t in 0..NTH {
+        th[t] = _mm256_set1_epi16(((qm >> (t + 1)).max(1) - 1) as i16);
+    }
+    let mut cnt = [_mm256_setzero_si256(); NTH];
+    let mut i = 0;
+    while i < k {
+        let a = _mm256_abs_epi16(_mm256_loadu_si256(x.add(i) as *const __m256i));
+        for t in 0..NTH {
+            cnt[t] = _mm256_sub_epi16(cnt[t], _mm256_cmpgt_epi16(a, th[t]));
+        }
+        i += 16;
+    }
+    let ones = _mm256_set1_epi16(1);
+    let mut best = 0;
+    for t in 0..NTH {
+        if hsum_i32(_mm256_madd_epi16(cnt[t], ones)) as usize <= kmax {
+            best = t;
+        } else {
+            break;
+        }
+    }
+    let thv = th[best];
+    let mut n = 0;
+    let mut i = 0;
+    while i < k && n < kmax {
+        let v = _mm256_loadu_si256(x.add(i) as *const __m256i);
+        let mut mk = _mm256_movemask_epi8(_mm256_cmpgt_epi16(_mm256_abs_epi16(v), thv)) as u32 & 0x5555_5555;
+        while mk != 0 && n < kmax {
+            let j = i + (mk.trailing_zeros() as usize >> 1);
+            sel.idx[n] = j as u16;
+            sel.val[n] = *x.add(j);
+            n += 1;
+            mk &= mk - 1;
+        }
+        i += 16;
+    }
+    sel.n = n;
+}
 
 // ---------------------------------------------------------------- timing (SMOL_TIME=1)
 static mut TIMING: bool = false;
@@ -75,8 +143,13 @@ fn dump_stats() {
 }
 
 // ---------------------------------------------------------------- pointers, memory
-#[derive(Clone, Copy)]
 struct P<T>(*const T);
+impl<T> Clone for P<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<T> Copy for P<T> {}
 unsafe impl<T> Send for P<T> {}
 unsafe impl<T> Sync for P<T> {}
 impl<T> P<T> {
@@ -85,8 +158,13 @@ impl<T> P<T> {
         self.0
     }
 }
-#[derive(Clone, Copy)]
 struct PM<T>(*mut T);
+impl<T> Clone for PM<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<T> Copy for PM<T> {}
 unsafe impl<T> Send for PM<T> {}
 unsafe impl<T> Sync for PM<T> {}
 impl<T> PM<T> {
@@ -270,8 +348,9 @@ unsafe fn bf16x8(p: *const u16) -> __m256 {
     _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(_mm_loadu_si128(p as *const __m128i)), 16))
 }
 
-// One weight row (k bf16 values, k % 32 == 0) -> int8 in [-127, 127]; returns the row's scale.
-unsafe fn quant_w_row(src: *const u16, k: usize, dst: *mut u8) -> f32 {
+// One weight row (k bf16 values, k % 32 == 0) -> int8 q in [-127, 127] and the low byte r, so that
+// w ~ s * (q + r / 256); returns the row's scale s.
+unsafe fn quant_w_row(src: *const u16, k: usize, dst: *mut u8, low: *mut u8) -> f32 {
     let absm = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fff_ffff));
     let mut mx = _mm256_setzero_ps();
     let mut i = 0;
@@ -286,14 +365,20 @@ unsafe fn quant_w_row(src: *const u16, k: usize, dst: *mut u8) -> f32 {
     let nlim = _mm256_set1_ps(-127.0);
     let idx = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
     let mut i = 0;
+    let c256 = _mm256_set1_ps(256.0);
     while i < k {
         let mut v = [_mm256_setzero_si256(); 4];
+        let mut r = [_mm256_setzero_si256(); 4];
         for t in 0..4 {
-            let f = _mm256_mul_ps(bf16x8(src.add(i + t * 8)), inv);
-            v[t] = _mm256_cvtps_epi32(_mm256_max_ps(_mm256_min_ps(f, lim), nlim));
+            let f = _mm256_max_ps(_mm256_min_ps(_mm256_mul_ps(bf16x8(src.add(i + t * 8)), inv), lim), nlim);
+            v[t] = _mm256_cvtps_epi32(f);
+            let d = _mm256_mul_ps(_mm256_sub_ps(f, _mm256_cvtepi32_ps(v[t])), c256);
+            r[t] = _mm256_cvtps_epi32(_mm256_max_ps(_mm256_min_ps(d, lim), nlim));
         }
         let b = _mm256_packs_epi16(_mm256_packs_epi32(v[0], v[1]), _mm256_packs_epi32(v[2], v[3]));
         _mm256_storeu_si256(dst.add(i) as *mut __m256i, _mm256_permutevar8x32_epi32(b, idx));
+        let b = _mm256_packs_epi16(_mm256_packs_epi32(r[0], r[1]), _mm256_packs_epi32(r[2], r[3]));
+        _mm256_storeu_si256(low.add(i) as *mut __m256i, _mm256_permutevar8x32_epi32(b, idx));
         i += 32;
     }
     s
@@ -381,9 +466,63 @@ struct Mat {
     sc: Vec<f32>,
     part: [P<u8>; MAXT],
     lo: [usize; MAXT + 1],
+    low: P<u8>, // low bytes: column-major [k][n] for the layer matrices, row-major [n][k] for the head
 }
 
-static mut PF_DIST: usize = 4096;
+const PF_DIST: usize = 4096; // weights are asked for this many bytes ahead of the row being read
+
+// corr[i] = sum over the selected columns of low[col][i] * x[col], for `rows` rows of this thread's share.
+// lowc points at column 0, first row of the share; columns are n bytes apart. corr needs rows + 16 slots.
+#[inline(always)]
+unsafe fn col_corr(lowc: *const u8, n: usize, rows: usize, sel: &Sel, corr: *mut i32) {
+    std::ptr::write_bytes(corr, 0, rows + 16);
+    let mut p = 0;
+    while p < sel.n {
+        let ca = lowc.add(sel.idx[p] as usize * n);
+        let (cb, xb) = if p + 1 < sel.n { (lowc.add(sel.idx[p + 1] as usize * n), sel.val[p + 1]) } else { (ca, 0) };
+        let xv = _mm256_set1_epi32((((xb as u16 as u32) << 16) | (sel.val[p] as u16 as u32)) as i32);
+        let mut i = 0;
+        while i < rows {
+            let a = _mm_loadu_si128(ca.add(i) as *const __m128i);
+            let b = _mm_loadu_si128(cb.add(i) as *const __m128i);
+            let c0 = _mm256_madd_epi16(_mm256_cvtepi8_epi16(_mm_unpacklo_epi8(a, b)), xv);
+            let c1 = _mm256_madd_epi16(_mm256_cvtepi8_epi16(_mm_unpackhi_epi8(a, b)), xv);
+            let d0 = corr.add(i) as *mut __m256i;
+            let d1 = corr.add(i + 8) as *mut __m256i;
+            _mm256_storeu_si256(d0, _mm256_add_epi32(_mm256_loadu_si256(d0), c0));
+            _mm256_storeu_si256(d1, _mm256_add_epi32(_mm256_loadu_si256(d1), c1));
+            i += 16;
+        }
+        p += 2;
+    }
+}
+
+// out holds `rows` exact integer dot products (as i32 bits); turn them into
+// (d * 256 + corr) * scale[row] * xs / 256 in f32. The 8-wide and the one-at-a-time forms round alike.
+#[inline(always)]
+unsafe fn finish(out: *mut f32, corr: *const i32, sc: *const f32, xs: f32, rows: usize) {
+    let xs = xs * (1.0 / 256.0);
+    let c256 = _mm256_set1_ps(256.0);
+    let xv = _mm256_set1_ps(xs);
+    let mut j = 0;
+    while j + 8 <= rows {
+        let d = _mm256_cvtepi32_ps(_mm256_loadu_si256(out.add(j) as *const __m256i));
+        let c = _mm256_cvtepi32_ps(_mm256_loadu_si256(corr.add(j) as *const __m256i));
+        let v = _mm256_mul_ps(_mm256_fmadd_ps(d, c256, c), _mm256_mul_ps(_mm256_loadu_ps(sc.add(j)), xv));
+        _mm256_storeu_ps(out.add(j), v);
+        j += 8;
+    }
+    while j < rows {
+        *out.add(j) = fin1(*(out.add(j) as *const i32), *corr.add(j), *sc.add(j), xs);
+        j += 1;
+    }
+}
+// one value of `finish`; xs256 = activation scale / 256
+#[inline(always)]
+unsafe fn fin1(d: i32, corr: i32, sc: f32, xs256: f32) -> f32 {
+    let v = _mm_fmadd_ss(_mm_cvtepi32_ps(_mm_cvtsi32_si128(d)), _mm_set_ss(256.0), _mm_cvtepi32_ps(_mm_cvtsi32_si128(corr)));
+    _mm_cvtss_f32(_mm_mul_ss(v, _mm_mul_ss(_mm_set_ss(sc), _mm_set_ss(xs256))))
+}
 
 #[inline(always)]
 unsafe fn dot_row(w: *const u8, x: *const i16, k: usize) -> i32 {
@@ -400,7 +539,8 @@ unsafe fn dot_row(w: *const u8, x: *const i16, k: usize) -> i32 {
     hsum_i32(_mm256_add_epi32(a0, a1))
 }
 
-// rows x one activation vector; streams the weights once. Returns (best value, best index) when track is set.
+// rows x one activation vector; streams the weights once and leaves exact dot products, then adds the
+// selected low-byte columns (sel may be null: none).
 #[inline(always)]
 unsafe fn gemv_k<const K: usize>(
     w: *const u8,
@@ -409,11 +549,25 @@ unsafe fn gemv_k<const K: usize>(
     sc: *const f32,
     xs: f32,
     out: *mut f32,
-    track: bool,
-) -> (f32, usize) {
+    lowc: *const u8,
+    n: usize,
+    sel: *const Sel,
+) {
     let pf = PF_DIST;
-    let mut bv = f32::NEG_INFINITY;
-    let mut bi = 0usize;
+    if !sel.is_null() {
+        // the low-byte columns are scattered: ask for them now, they arrive while the weights stream
+        let sel = &*sel;
+        for p in 0..sel.n {
+            let c = lowc.add(sel.idx[p] as usize * n);
+            let mut i = 0;
+            while i < rows {
+                _mm_prefetch::<_MM_HINT_T0>(c.add(i) as *const i8);
+                i += 64;
+            }
+            _mm_prefetch::<_MM_HINT_T0>(c.add(rows - 1) as *const i8);
+        }
+    }
+    let oi = out as *mut i32;
     for j in 0..rows {
         let wr = w.add(j * K);
         if pf != 0 {
@@ -423,35 +577,123 @@ unsafe fn gemv_k<const K: usize>(
                 c += 64;
             }
         }
-        let v = dot_row(wr, x, K) as f32 * (*sc.add(j) * xs);
-        *out.add(j) = v;
-        if track && v > bv {
+        *oi.add(j) = dot_row(wr, x, K);
+    }
+    if sel.is_null() {
+        finish0(out, sc, xs, rows);
+    } else {
+        let mut corr = std::mem::MaybeUninit::<[i32; GU + 16]>::uninit();
+        let cp = corr.as_mut_ptr() as *mut i32;
+        col_corr(lowc, n, rows, &*sel, cp);
+        finish(out, cp, sc, xs, rows);
+    }
+}
+
+// `finish` without low bytes: d * (scale[row] * xs)
+#[inline(always)]
+unsafe fn finish0(out: *mut f32, sc: *const f32, xs: f32, rows: usize) {
+    let xv = _mm256_set1_ps(xs);
+    let mut j = 0;
+    while j + 8 <= rows {
+        let d = _mm256_cvtepi32_ps(_mm256_loadu_si256(out.add(j) as *const __m256i));
+        _mm256_storeu_ps(out.add(j), _mm256_mul_ps(d, _mm256_mul_ps(_mm256_loadu_ps(sc.add(j)), xv)));
+        j += 8;
+    }
+    while j < rows {
+        *out.add(j) = *(out.add(j) as *const i32) as f32 * (*sc.add(j) * xs);
+        j += 1;
+    }
+}
+
+// The head for one activation vector, first pass: exact dot products for this thread's rows (left as i32
+// bits in out) and the largest logit they give before any low bytes.
+unsafe fn gemv_head(w: *const u8, rows: usize, x: *const i16, sc: *const f32, xs: f32, out: *mut f32) -> f32 {
+    let pf = PF_DIST;
+    let mut bv = f32::NEG_INFINITY;
+    let oi = out as *mut i32;
+    for j in 0..rows {
+        let wr = w.add(j * H);
+        if pf != 0 {
+            let mut c = 0;
+            while c < H {
+                _mm_prefetch::<_MM_HINT_T0>(wr.wrapping_add(pf + c) as *const i8);
+                c += 64;
+            }
+        }
+        let d = dot_row(wr, x, H);
+        *oi.add(j) = d;
+        let v = d as f32 * (*sc.add(j) * xs);
+        if v > bv {
             bv = v;
-            bi = j;
+        }
+    }
+    bv
+}
+
+// Second pass over thread tid's head rows: dot products -> logits, and rows at or above thr get their low
+// byte added. Returns the best of those refined rows (value, row), lowest row on a tie.
+unsafe fn head_finish(w: &Mat, tid: usize, xq: *const i16, xs: f32, logits: *mut f32, thr: f32) -> (f32, usize) {
+    let (lo, hi) = (w.lo[tid], w.lo[tid + 1]);
+    let (low, sc) = (w.low.get(), w.sc.as_ptr());
+    let xs256 = xs * (1.0 / 256.0);
+    let (thv, xv) = (_mm256_set1_ps(thr), _mm256_set1_ps(xs));
+    let mut bv = f32::NEG_INFINITY;
+    let mut bi = 0usize;
+    let mut hits = [(0usize, 0i32); 64];
+    let mut nh = 0;
+    let mut j = lo;
+    loop {
+        if j + 8 <= hi {
+            let dv = _mm256_loadu_si256(logits.add(j) as *const __m256i);
+            let v = _mm256_mul_ps(_mm256_cvtepi32_ps(dv), _mm256_mul_ps(_mm256_loadu_ps(sc.add(j)), xv));
+            let mut mk = _mm256_movemask_ps(_mm256_cmp_ps::<_CMP_GE_OQ>(v, thv)) as u32;
+            while mk != 0 {
+                let i = j + mk.trailing_zeros() as usize;
+                hits[nh] = (i, *(logits.add(i) as *const i32));
+                nh += 1;
+                mk &= mk - 1;
+            }
+            _mm256_storeu_ps(logits.add(j), v);
+            j += 8;
+        } else if j < hi {
+            let d = *(logits.add(j) as *const i32);
+            let v = d as f32 * (*sc.add(j) * xs);
+            if v >= thr {
+                hits[nh] = (j, d);
+                nh += 1;
+            }
+            *logits.add(j) = v;
+            j += 1;
+        }
+        if nh > 56 || j >= hi {
+            for &(i, _) in &hits[..nh] {
+                let lr = low.add(i * H);
+                let mut c = 0;
+                while c < H {
+                    _mm_prefetch::<_MM_HINT_T0>(lr.add(c) as *const i8);
+                    c += 64;
+                }
+            }
+            for &(i, d) in &hits[..nh] {
+                let v = fin1(d, dot_row(low.add(i * H), xq, H), *sc.add(i), xs256);
+                *logits.add(i) = v;
+                if v > bv {
+                    bv = v;
+                    bi = i;
+                }
+            }
+            nh = 0;
+            if j >= hi {
+                break;
+            }
         }
     }
     (bv, bi)
 }
 
-unsafe fn gemv(w: *const u8, k: usize, rows: usize, x: *const i16, sc: *const f32, xs: f32, out: *mut f32, track: bool) -> (f32, usize) {
-    if k == H {
-        gemv_k::<H>(w, rows, x, sc, xs, out, track)
-    } else {
-        gemv_k::<FF>(w, rows, x, sc, xs, out, track)
-    }
-}
-
-// NW weight rows x NX activation rows, full dot products in i32.
+// NW weight rows x NX activation rows, full dot products in i32 (stored as i32 bits in out).
 #[inline(always)]
-unsafe fn tile<const NW: usize, const NX: usize>(
-    w: *const u8,
-    k: usize,
-    x: *const i16,
-    sc: *const f32,
-    xs: *const f32,
-    out: *mut f32,
-    ostride: usize,
-) {
+unsafe fn tile<const NW: usize, const NX: usize>(w: *const u8, k: usize, x: *const i16, out: *mut f32, ostride: usize) {
     let mut acc = [[_mm256_setzero_si256(); NX]; NW];
     let mut t = 0;
     while t < k {
@@ -468,9 +710,8 @@ unsafe fn tile<const NW: usize, const NX: usize>(
         t += 16;
     }
     for a in 0..NW {
-        let s = *sc.add(a);
         for r in 0..NX {
-            *out.add(r * ostride + a) = hsum_i32(acc[a][r]) as f32 * (s * *xs.add(r));
+            *(out.add(r * ostride + a) as *mut i32) = hsum_i32(acc[a][r]);
         }
     }
 }
@@ -487,6 +728,9 @@ unsafe fn gemm_part(
     sc: *const f32,
     out: *mut f32,
     ostride: usize,
+    lowc: *const u8,
+    n: usize,
+    sel: *const Sel,
 ) {
     let wch = ((192 * 1024 / k) & !1).max(2);
     let xb = (((20 * 1024) / (2 * k)) & !3).clamp(4, 32);
@@ -505,16 +749,15 @@ unsafe fn gemm_part(
                     let nx = (i1 - i).min(4);
                     let xp = x.add(i * k);
                     let op = out.add(i * ostride + j);
-                    let (scp, xsp) = (sc.add(j), xs.add(i));
                     match (nw, nx) {
-                        (2, 4) => tile::<2, 4>(wp, k, xp, scp, xsp, op, ostride),
-                        (2, 3) => tile::<2, 3>(wp, k, xp, scp, xsp, op, ostride),
-                        (2, 2) => tile::<2, 2>(wp, k, xp, scp, xsp, op, ostride),
-                        (2, _) => tile::<2, 1>(wp, k, xp, scp, xsp, op, ostride),
-                        (_, 4) => tile::<1, 4>(wp, k, xp, scp, xsp, op, ostride),
-                        (_, 3) => tile::<1, 3>(wp, k, xp, scp, xsp, op, ostride),
-                        (_, 2) => tile::<1, 2>(wp, k, xp, scp, xsp, op, ostride),
-                        _ => tile::<1, 1>(wp, k, xp, scp, xsp, op, ostride),
+                        (2, 4) => tile::<2, 4>(wp, k, xp, op, ostride),
+                        (2, 3) => tile::<2, 3>(wp, k, xp, op, ostride),
+                        (2, 2) => tile::<2, 2>(wp, k, xp, op, ostride),
+                        (2, _) => tile::<2, 1>(wp, k, xp, op, ostride),
+                        (_, 4) => tile::<1, 4>(wp, k, xp, op, ostride),
+                        (_, 3) => tile::<1, 3>(wp, k, xp, op, ostride),
+                        (_, 2) => tile::<1, 2>(wp, k, xp, op, ostride),
+                        _ => tile::<1, 1>(wp, k, xp, op, ostride),
                     }
                     i += nx;
                 }
@@ -524,11 +767,24 @@ unsafe fn gemm_part(
         }
         j0 = j1;
     }
+    if sel.is_null() {
+        for i in 0..m {
+            finish0(out.add(i * ostride), sc, *xs.add(i), rows);
+        }
+    } else {
+        let mut corr = std::mem::MaybeUninit::<[i32; GU + 16]>::uninit();
+        let cp = corr.as_mut_ptr() as *mut i32;
+        for i in 0..m {
+            col_corr(lowc, n, rows, &*sel.add(i), cp);
+            finish(out.add(i * ostride), cp, sc, *xs.add(i), rows);
+        }
+    }
 }
 
-// out[i * ostride + j] = sum_c x[i][c] * W[j][c], for m activation rows.
-fn matmul(pool: &Pool, w: &Mat, xq: *const i16, xs: *const f32, m: usize, out: *mut f32, ostride: usize) {
-    let (px, ps, po, pw) = (P(xq), P(xs), PM(out), P(w as *const Mat));
+// out[i * ostride + j] = sum_c x[i][c] * W[j][c] for m activation rows; sel (one per row, or null) names the
+// columns that also get their low byte.
+fn matmul(pool: &Pool, w: &Mat, xq: *const i16, xs: *const f32, m: usize, out: *mut f32, ostride: usize, sel: *const Sel) {
+    let (px, ps, po, pw, psel) = (P(xq), P(xs), PM(out), P(w as *const Mat), P(sel));
     pool.run(move |tid| unsafe {
         let w = &*pw.get();
         let (lo, hi) = (w.lo[tid], w.lo[tid + 1]);
@@ -537,36 +793,173 @@ fn matmul(pool: &Pool, w: &Mat, xq: *const i16, xs: *const f32, m: usize, out: *
         }
         let wp = w.part[tid].get();
         let sc = w.sc.as_ptr().add(lo);
+        let (rows, sel) = (hi - lo, psel.get());
+        let lowc = if sel.is_null() { std::ptr::null() } else { w.low.get().add(lo) };
         if m == 1 {
-            gemv(wp, w.k, hi - lo, px.get(), sc, *ps.get(), po.get().add(lo), false);
+            if w.k == H {
+                gemv_k::<H>(wp, rows, px.get(), sc, *ps.get(), po.get().add(lo), lowc, w.n, sel);
+            } else {
+                gemv_k::<FF>(wp, rows, px.get(), sc, *ps.get(), po.get().add(lo), lowc, w.n, sel);
+            }
         } else {
-            gemm_part(wp, w.k, hi - lo, px.get(), ps.get(), m, sc, po.get().add(lo), ostride);
+            gemm_part(wp, w.k, rows, px.get(), ps.get(), m, sc, po.get().add(lo), ostride, lowc, w.n, sel);
         }
     });
 }
 
-// One activation row x the output head: fills logits, returns the argmax (lowest id on a tie).
+// Head rows of thread tid whose logit is at least thr get their low byte added (logits updated in place).
+// Returns the best refined (value, row).
+unsafe fn head_refine(w: &Mat, tid: usize, xq: *const i16, xs: f32, logits: *mut f32, thr: f32) -> (f32, usize) {
+    let (lo, hi) = (w.lo[tid], w.lo[tid + 1]);
+    let (base, low, sc) = (w.part[tid].get(), w.low.get(), w.sc.as_ptr());
+    let xs256 = xs * (1.0 / 256.0);
+    let thv = _mm256_set1_ps(thr);
+    let mut bv = f32::NEG_INFINITY;
+    let mut bi = 0usize;
+    let mut hits = [0usize; 64];
+    let mut nh = 0;
+    let mut j = lo;
+    loop {
+        let mut mk = 0u32;
+        if j + 8 <= hi {
+            mk = _mm256_movemask_ps(_mm256_cmp_ps::<_CMP_GE_OQ>(_mm256_loadu_ps(logits.add(j)), thv)) as u32;
+        } else {
+            for t in 0..hi.saturating_sub(j) {
+                mk |= ((*logits.add(j + t) >= thr) as u32) << t;
+            }
+        }
+        while mk != 0 {
+            hits[nh] = j + mk.trailing_zeros() as usize;
+            nh += 1;
+            mk &= mk - 1;
+        }
+        j += 8;
+        if nh > 56 || j >= hi {
+            for &i in &hits[..nh] {
+                let (lr, br) = (low.add(i * H), base.add((i - lo) * H));
+                let mut c = 0;
+                while c < H {
+                    _mm_prefetch::<_MM_HINT_T0>(lr.add(c) as *const i8);
+                    _mm_prefetch::<_MM_HINT_T0>(br.add(c) as *const i8);
+                    c += 64;
+                }
+            }
+            for &i in &hits[..nh] {
+                let d = dot_row(base.add((i - lo) * H), xq, H);
+                let l = dot_row(low.add(i * H), xq, H);
+                let v = fin1(d, l, *sc.add(i), xs256);
+                *logits.add(i) = v;
+                if v > bv {
+                    bv = v;
+                    bi = i;
+                }
+            }
+            nh = 0;
+            if j >= hi {
+                break;
+            }
+        }
+    }
+    (bv, bi)
+}
+
+fn argmax(v: &[f32]) -> usize {
+    let mut bi = 0usize;
+    let mut bv = f32::NEG_INFINITY;
+    for (i, &x) in v.iter().enumerate() {
+        if x > bv {
+            bv = x;
+            bi = i;
+        }
+    }
+    bi
+}
+
+// One activation row x the output head: fills logits (VV), returns the argmax (lowest id on a tie).
 fn head_argmax(pool: &Pool, w: &Mat, xq: *const i16, xs: f32, logits: *mut f32) -> u32 {
+    let mut mx = [f32::NEG_INFINITY; MAXT];
     let mut best = [(f32::NEG_INFINITY, 0usize); MAXT];
-    let (px, po, pw, pb) = (P(xq), PM(logits), P(w as *const Mat), PM(best.as_mut_ptr()));
+    let (px, po, pw) = (P(xq), PM(logits), P(w as *const Mat));
+    let (pm, pb) = (PM(mx.as_mut_ptr()), PM(best.as_mut_ptr()));
     pool.run(move |tid| unsafe {
         let w = &*pw.get();
         let (lo, hi) = (w.lo[tid], w.lo[tid + 1]);
-        if lo >= hi {
-            return;
+        if lo < hi {
+            *pm.get().add(tid) = gemv_head(w.part[tid].get(), hi - lo, px.get(), w.sc.as_ptr().add(lo), xs, po.get().add(lo));
         }
-        let (v, i) = gemv(w.part[tid].get(), w.k, hi - lo, px.get(), w.sc.as_ptr().add(lo), xs, po.get().add(lo), true);
-        *pb.get().add(tid) = (v, lo + i);
     });
-    let mut bv = f32::NEG_INFINITY;
-    let mut bi = 0usize;
-    for t in 0..pool.n {
-        if best[t].0 > bv {
-            bv = best[t].0;
-            bi = best[t].1;
+    let n = pool.n;
+    let top = mx[..n].iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+    let t = HEAD_T;
+    // no cut (or nothing finite): refine nothing and compare all rows below
+    let thr = if t > 0.0 && top.is_finite() { top - t } else { f32::INFINITY };
+    pool.run(move |tid| unsafe {
+        let w = &*pw.get();
+        if w.lo[tid] < w.lo[tid + 1] {
+            *pb.get().add(tid) = head_finish(w, tid, px.get(), xs, po.get(), thr);
+        }
+    });
+    let mut b = (f32::NEG_INFINITY, 0usize);
+    for t in 0..n {
+        if best[t].0 > b.0 {
+            b = best[t];
         }
     }
-    bi as u32
+    if b.0 >= thr {
+        b.1 as u32
+    } else {
+        // every refined row fell below the cut (or nothing is finite): compare all rows
+        argmax(unsafe { std::slice::from_raw_parts(logits, VV) }) as u32
+    }
+}
+
+// Head for m activation rows (logits rows are VV apart), same values as head_argmax writes.
+fn head_rows(pool: &Pool, w: &Mat, xq: *const i16, xs: *const f32, m: usize, logits: *mut f32) {
+    matmul(pool, w, xq, xs, m, logits, VV, std::ptr::null());
+    let t = HEAD_T;
+    if !(t > 0.0) {
+        return;
+    }
+    let nt = pool.n;
+    let mut mx = vec![f32::NEG_INFINITY; nt * m];
+    let (px, ps, po, pw, pm) = (P(xq), P(xs), PM(logits), P(w as *const Mat), PM(mx.as_mut_ptr()));
+    pool.run(move |tid| unsafe {
+        let w = &*pw.get();
+        let (lo, hi) = (w.lo[tid], w.lo[tid + 1]);
+        for r in 0..m {
+            let row = po.get().add(r * VV);
+            let mut a = _mm256_set1_ps(f32::NEG_INFINITY);
+            let mut j = lo;
+            while j + 8 <= hi {
+                a = _mm256_max_ps(a, _mm256_loadu_ps(row.add(j)));
+                j += 8;
+            }
+            let mut v = hmax(a);
+            while j < hi {
+                v = v.max(*row.add(j));
+                j += 1;
+            }
+            *pm.get().add(tid * m + r) = v;
+        }
+    });
+    for r in 0..m {
+        let mut v = f32::NEG_INFINITY;
+        for t2 in 0..nt {
+            v = v.max(mx[t2 * m + r]);
+        }
+        mx[r] = v - t; // thread 0's slots become the cut for each row
+    }
+    pool.run(move |tid| unsafe {
+        let w = &*pw.get();
+        if w.lo[tid] < w.lo[tid + 1] {
+            for r in 0..m {
+                let thr = *pm.get().add(r);
+                if thr.is_finite() {
+                    head_refine(w, tid, px.get().add(r * H), *ps.get().add(r), po.get().add(r * VV), thr);
+                }
+            }
+        }
+    });
 }
 
 // ---------------------------------------------------------------- model
@@ -661,8 +1054,20 @@ fn load_model(dir: &str, pool: &Pool) -> Model {
     let nt = pool.n;
     let mut mats: Vec<Mat> = Vec::with_capacity(srcs.len());
     let mut size = [0usize; MAXT];
+    // low bytes: one block, each matrix n * k bytes (+16 so 16-byte loads may run past a column)
+    let low_total: usize = srcs.iter().map(|s| s.n * s.k + 16).sum();
+    let low_base = huge_alloc(low_total, false);
+    let mut low_off = 0usize;
     for s in &srcs {
-        let mut mt = Mat { n: s.n, k: s.k, sc: vec![0f32; s.n], part: [P(std::ptr::null()); MAXT], lo: [s.n; MAXT + 1] };
+        let mut mt = Mat {
+            n: s.n,
+            k: s.k,
+            sc: vec![0f32; s.n],
+            part: [P(std::ptr::null()); MAXT],
+            lo: [s.n; MAXT + 1],
+            low: P(unsafe { low_base.add(low_off) } as *const u8),
+        };
+        low_off += s.n * s.k + 16;
         for t in 0..nt {
             let (lo, hi) = split(s.n, nt, t);
             mt.lo[t] = lo;
@@ -689,8 +1094,21 @@ fn load_model(dir: &str, pool: &Pool) -> Model {
                 let s = &*psrc.get().add(mi);
                 let mt = &*pmat.get().add(mi);
                 let sc = (*psc.get().add(mi)).get();
+                let low = mt.low.get() as *mut u8;
+                let head = mi + 1 == nm;
+                let mut tmp = [0u8; FF];
                 for r in mt.lo[tid]..mt.lo[tid + 1] {
-                    *sc.add(r) = quant_w_row(s.row(r), s.k, dst);
+                    if head {
+                        *sc.add(r) = quant_w_row(s.row(r), s.k, dst, low.add(r * s.k));
+                    } else {
+                        // column-major: byte (row r, column j) at j * n + r
+                        *sc.add(r) = quant_w_row(s.row(r), s.k, dst, tmp.as_mut_ptr());
+                        let mut lp = low.add(r);
+                        for j in 0..s.k {
+                            *lp = tmp[j];
+                            lp = lp.add(s.n);
+                        }
+                    }
                     dst = dst.add(s.k);
                 }
             }
@@ -711,19 +1129,27 @@ fn load_model(dir: &str, pool: &Pool) -> Model {
 }
 
 // ---------------------------------------------------------------- state
+// Key/value cache in half precision (the caches are re-read from memory for every new token).
 // K: [kv head][layer][block of 8 positions][64 dims][8]   V: [kv head][layer][position][64]
 struct Caches {
     ctx: usize,
     nb: usize,
-    k: PM<f32>,
-    v: PM<f32>,
+    k: PM<u16>,
+    v: PM<u16>,
+    // the same (half-precision) values as f32 for the first `pre` positions: multi-row passes read these
+    // and skip the conversions
+    pre: usize,
+    nbp: usize,
+    kf: PM<f32>,
+    vf: PM<f32>,
     cos: Vec<f32>, // [ctx][32]
     sin: Vec<f32>,
     len: usize,
 }
 impl Caches {
-    fn new(ctx: usize) -> Caches {
+    fn new(ctx: usize, pre: usize) -> Caches {
         let nb = (ctx + 7) / 8;
+        let nbp = (pre + 7) / 8;
         let mut cos = vec![0f32; ctx * 32];
         let mut sin = vec![0f32; ctx * 32];
         for i in 0..32 {
@@ -737,8 +1163,12 @@ impl Caches {
         Caches {
             ctx,
             nb,
-            k: PM(huge_alloc(NL * NKV * nb * 512 * 4, true) as *mut f32),
-            v: PM(huge_alloc(NL * NKV * ctx * 64 * 4, true) as *mut f32),
+            k: PM(huge_alloc(NL * NKV * nb * 512 * 2, true) as *mut u16),
+            v: PM(huge_alloc(NL * NKV * ctx * 64 * 2, true) as *mut u16),
+            pre,
+            nbp,
+            kf: PM(huge_alloc(NL * NKV * nbp * 512 * 4, true) as *mut f32),
+            vf: PM(huge_alloc(NL * NKV * pre * 64 * 4, true) as *mut f32),
             cos,
             sin,
             len: 0,
@@ -759,6 +1189,9 @@ struct Bufs {
     gq: Vec<i16>,
     gs: Vec<f32>,
     scr: Vec<PM<f32>>, // attention scores, one scratch per thread
+    selx: Vec<Sel>,    // low-byte columns per row: for xq, aq, gq
+    sela: Vec<Sel>,
+    selg: Vec<Sel>,
 }
 impl Bufs {
     fn new(m: usize, ctx: usize, nt: usize) -> Bufs {
@@ -776,6 +1209,9 @@ impl Bufs {
             gq: vec![0i16; m * FF],
             gs: vec![0f32; m],
             scr: (0..nt).map(|_| PM(Vec::leak(vec![0f32; rows * 3 * (ctx + 16)]).as_mut_ptr())).collect(),
+            selx: vec![SEL0; m],
+            sela: vec![SEL0; m],
+            selg: vec![SEL0; m],
         }
     }
 }
@@ -877,11 +1313,19 @@ unsafe fn pv_row(p: *const f32, v: *const f32, n: usize, out: *mut f32, first: b
     }
 }
 
+const VB: usize = 64; // positions of V handled together
+
 // One key/value head (its three query heads) for m new rows at positions pos0..: rotate q and k, append
 // K and V to the cache, then attend. qkv rows are QKV apart, ao rows QDIM apart.
 unsafe fn attn_head(nc: &Caches, l: usize, kh: usize, qkv: *mut f32, ao: *mut f32, m: usize, pos0: usize, scr: *mut f32) {
+    const RN: i32 = _MM_FROUND_TO_NEAREST_INT;
     let kb = nc.k.get().add((kh * NL + l) * nc.nb * 512);
     let vb = nc.v.get().add((kh * NL + l) * nc.ctx * 64);
+    // multi-row passes (prompt, ppl windows) use the f32 copies; single rows convert as they go
+    let wide = m > 1;
+    debug_assert!(!wide || pos0 + m <= nc.pre);
+    let kfb = nc.kf.get().add((kh * NL + l) * nc.nbp * 512);
+    let vfb = nc.vf.get().add((kh * NL + l) * nc.pre * 64);
     for i in 0..m {
         let p = pos0 + i;
         let (cs, sn) = (nc.cos.as_ptr().add(p * 32), nc.sin.as_ptr().add(p * 32));
@@ -891,12 +1335,31 @@ unsafe fn attn_head(nc: &Caches, l: usize, kh: usize, qkv: *mut f32, ao: *mut f3
         }
         let kr = row.add(QDIM + kh * 64);
         rope64(kr, cs, sn);
+        let vr = row.add(QDIM + KVDIM + kh * 64);
         let kd = kb.add((p >> 3) * 512 + (p & 7));
-        for d in 0..64 {
-            *kd.add(d * 8) = *kr.add(d);
+        let mut kh16 = [0u16; 64];
+        for t in 0..8 {
+            let k16 = _mm256_cvtps_ph::<RN>(_mm256_loadu_ps(kr.add(t * 8)));
+            let v16 = _mm256_cvtps_ph::<RN>(_mm256_loadu_ps(vr.add(t * 8)));
+            _mm_storeu_si128(kh16.as_mut_ptr().add(t * 8) as *mut __m128i, k16);
+            _mm_storeu_si128(vb.add(p * 64 + t * 8) as *mut __m128i, v16);
+            if wide {
+                _mm256_storeu_ps(kr.add(t * 8), _mm256_cvtph_ps(k16)); // kr now holds the rounded key
+                _mm256_storeu_ps(vfb.add(p * 64 + t * 8), _mm256_cvtph_ps(v16));
+            }
         }
-        std::ptr::copy_nonoverlapping(row.add(QDIM + KVDIM + kh * 64) as *const f32, vb.add(p * 64), 64);
+        for d in 0..64 {
+            *kd.add(d * 8) = kh16[d];
+        }
+        if wide {
+            let kd = kfb.add((p >> 3) * 512 + (p & 7));
+            for d in 0..64 {
+                *kd.add(d * 8) = *kr.add(d);
+            }
+        }
     }
+    let mut vf = [0f32; VB * 64]; // V rows of the current block, back in f32
+    let mut kf = [0f32; 4 * 512]; // key blocks of the current group, back in f32
     let mut i0 = 0;
     while i0 < m {
         let rows = AR.min(m - i0);
@@ -906,6 +1369,11 @@ unsafe fn attn_head(nc: &Caches, l: usize, kh: usize, qkv: *mut f32, ao: *mut f3
         // scores, key blocks in the outer loop so they stay in L1 across the query rows
         let mut g = 0;
         while g < nbmax {
+            let mut t = 0;
+            while !wide && t < (nbmax - g).min(4) * 512 {
+                _mm256_storeu_ps(kf.as_mut_ptr().add(t), _mm256_cvtph_ps(_mm_loadu_si128(kb.add(g * 512 + t) as *const __m128i)));
+                t += 8;
+            }
             for r in 0..rows {
                 let nbr = (pos0 + i0 + r + 8) >> 3;
                 if g >= nbr {
@@ -913,7 +1381,7 @@ unsafe fn attn_head(nc: &Caches, l: usize, kh: usize, qkv: *mut f32, ao: *mut f3
                 }
                 let q = qkv.add((i0 + r) * QKV + kh * 3 * 64) as *const f32;
                 let o = scr.add(r * 3 * ss + g * 8);
-                let kp = kb.add(g * 512) as *const f32;
+                let kp = if wide { kfb.add(g * 512) as *const f32 } else { kf.as_ptr() };
                 match (nbr - g).min(4) {
                     4 => score_tile::<4>(q, kp, o, ss),
                     3 => score_tile::<3>(q, kp, o, ss),
@@ -928,26 +1396,27 @@ unsafe fn attn_head(nc: &Caches, l: usize, kh: usize, qkv: *mut f32, ao: *mut f3
                 softmax(scr.add((r * 3 + x) * ss), pos0 + i0 + r + 1);
             }
         }
-        // weighted sums of V, 64 positions at a time
+        // weighted sums of V, VB positions at a time
         let mut j0 = 0;
         while j0 < maxlen {
+            let nv = (maxlen - j0).min(VB);
+            let mut t = 0;
+            while !wide && t < nv * 64 {
+                _mm256_storeu_ps(vf.as_mut_ptr().add(t), _mm256_cvtph_ps(_mm_loadu_si128(vb.add(j0 * 64 + t) as *const __m128i)));
+                t += 8;
+            }
+            let vp = if wide { vfb.add(j0 * 64) as *const f32 } else { vf.as_ptr() };
             for r in 0..rows {
                 let len = pos0 + i0 + r + 1;
                 if j0 >= len {
                     continue;
                 }
-                let n = (len - j0).min(64);
+                let n = (len - j0).min(VB);
                 for x in 0..3 {
-                    pv_row(
-                        scr.add((r * 3 + x) * ss + j0),
-                        vb.add(j0 * 64),
-                        n,
-                        ao.add((i0 + r) * QDIM + (kh * 3 + x) * 64),
-                        j0 == 0,
-                    );
+                    pv_row(scr.add((r * 3 + x) * ss + j0), vp, n, ao.add((i0 + r) * QDIM + (kh * 3 + x) * 64), j0 == 0);
                 }
             }
-            j0 += 64;
+            j0 += VB;
         }
         i0 += rows;
     }
@@ -972,46 +1441,56 @@ fn forward(md: &Model, pool: &Pool, nc: &mut Caches, b: &mut Bufs, m: usize) {
     let pos0 = nc.len;
     assert!(pos0 + m <= nc.ctx);
     let (ph, ptmp) = (PM(b.h.as_mut_ptr()), PM(b.tmp.as_mut_ptr()));
-    let (pxq, pxs) = (PM(b.xq.as_mut_ptr()), PM(b.xs.as_mut_ptr()));
-    let (pao, paq, paz) = (PM(b.ao.as_mut_ptr()), PM(b.aq.as_mut_ptr()), PM(b.az.as_mut_ptr()));
-    let (pgu, pgq, pgs) = (PM(b.gu.as_mut_ptr()), PM(b.gq.as_mut_ptr()), PM(b.gs.as_mut_ptr()));
+    let (pxq, pxs, psx) = (PM(b.xq.as_mut_ptr()), PM(b.xs.as_mut_ptr()), PM(b.selx.as_mut_ptr()));
+    let (pao, paq, paz, psa) = (PM(b.ao.as_mut_ptr()), PM(b.aq.as_mut_ptr()), PM(b.az.as_mut_ptr()), PM(b.sela.as_mut_ptr()));
+    let (pgu, pgq, pgs, psg) = (PM(b.gu.as_mut_ptr()), PM(b.gq.as_mut_ptr()), PM(b.gs.as_mut_ptr()), PM(b.selg.as_mut_ptr()));
+    let ks = KSEL;
+    let (qh, qf) = (QM_H as i32, QM_FF as i32);
     let mut t = tick();
     {
         let w = P(md.layers[0].an.as_ptr());
         par_rows(pool, m, move |r| unsafe {
             *pxs.get().add(r) = rmsnorm_quant(ph.get().add(r * H), w.get(), pxq.get().add(r * H));
+            select(pxq.get().add(r * H), H, qh, ks[0], psx.get().add(r));
         });
     }
     tock(0, &mut t);
     for l in 0..NL {
         let lay = &md.layers[l];
-        matmul(pool, &lay.wqkv, pxq.get(), pxs.get(), m, b.qkv.as_mut_ptr(), QKV);
+        matmul(pool, &lay.wqkv, pxq.get(), pxs.get(), m, b.qkv.as_mut_ptr(), QKV, psx.get());
         tock(1, &mut t);
         attention(pool, nc, b, l, m, pos0);
         tock(2, &mut t);
         par_rows(pool, m, move |r| unsafe {
             *paz.get().add(r) = quant_row(pao.get().add(r * QDIM), QDIM, paq.get().add(r * QDIM), QM_H);
+            select(paq.get().add(r * QDIM), QDIM, qh, ks[1], psa.get().add(r));
         });
-        matmul(pool, &lay.wo, paq.get(), paz.get(), m, ptmp.get(), H);
+        matmul(pool, &lay.wo, paq.get(), paz.get(), m, ptmp.get(), H, psa.get());
         tock(3, &mut t);
         let w = P(lay.fnn.as_ptr());
         par_rows(pool, m, move |r| unsafe {
             add_row(ph.get().add(r * H), ptmp.get().add(r * H));
             *pxs.get().add(r) = rmsnorm_quant(ph.get().add(r * H), w.get(), pxq.get().add(r * H));
+            select(pxq.get().add(r * H), H, qh, ks[2], psx.get().add(r));
         });
         tock(0, &mut t);
-        matmul(pool, &lay.wgu, pxq.get(), pxs.get(), m, pgu.get(), GU);
+        matmul(pool, &lay.wgu, pxq.get(), pxs.get(), m, pgu.get(), GU, psx.get());
         tock(4, &mut t);
         par_rows(pool, m, move |r| unsafe {
             *pgs.get().add(r) = silu_quant(pgu.get().add(r * GU), pgq.get().add(r * FF));
+            select(pgq.get().add(r * FF), FF, qf, ks[3], psg.get().add(r));
         });
         tock(0, &mut t);
-        matmul(pool, &lay.wdown, pgq.get(), pgs.get(), m, ptmp.get(), H);
+        matmul(pool, &lay.wdown, pgq.get(), pgs.get(), m, ptmp.get(), H, psg.get());
         tock(5, &mut t);
-        let w = P(if l + 1 < NL { md.layers[l + 1].an.as_ptr() } else { md.norm.as_ptr() });
+        let last = l + 1 == NL;
+        let w = P(if last { md.norm.as_ptr() } else { md.layers[l + 1].an.as_ptr() });
         par_rows(pool, m, move |r| unsafe {
             add_row(ph.get().add(r * H), ptmp.get().add(r * H));
             *pxs.get().add(r) = rmsnorm_quant(ph.get().add(r * H), w.get(), pxq.get().add(r * H));
+            if !last {
+                select(pxq.get().add(r * H), H, qh, ks[0], psx.get().add(r));
+            }
         });
         tock(0, &mut t);
     }
@@ -1098,9 +1577,6 @@ fn main() {
     }
     unsafe {
         TIMING = std::env::var("SMOL_TIME").is_ok();
-        if let Ok(v) = std::env::var("SMOL_PF") {
-            PF_DIST = v.parse().unwrap_or(PF_DIST);
-        }
     }
     let mut nt = std::thread::available_parallelism().map(|v| v.get()).unwrap_or(1);
     if let Ok(v) = std::env::var("SMOL_NT") {
@@ -1114,8 +1590,8 @@ fn main() {
         let ids = read_u32s(&tokens_in.expect("--tokens required"));
         let n = ids.len();
         let win = ctx.max(1).min(n.max(1));
-        let mut nc = Caches::new(win);
         let msz = CB.min(win);
+        let mut nc = Caches::new(win, if msz > 1 { win } else { 0 });
         let mut b = Bufs::new(msz, win, nt);
         let mut out = std::fs::File::create(&logits_out.expect("--logits required")).unwrap();
         let lrows = 32.min(msz);
@@ -1133,7 +1609,7 @@ fn main() {
                 let mut r0 = 0;
                 while r0 < m {
                     let rm = lrows.min(m - r0);
-                    matmul(&pool, &model.head, b.xq[r0 * H..].as_ptr(), b.xs[r0..].as_ptr(), rm, logits.as_mut_ptr(), VV);
+                    head_rows(&pool, &model.head, b.xq[r0 * H..].as_ptr(), b.xs[r0..].as_ptr(), rm, logits.as_mut_ptr());
                     out.write_all(as_bytes(&logits[..rm * VV])).unwrap();
                     r0 += rm;
                 }
@@ -1176,7 +1652,7 @@ fn main() {
     let plen = ctx_ids.len();
     let ctx_cap = plen + ngen;
     let msz = CB.min(plen);
-    let mut nc = Caches::new(ctx_cap);
+    let mut nc = Caches::new(ctx_cap, if msz > 1 { plen } else { 0 });
     let mut b = Bufs::new(msz, ctx_cap, nt);
     let mut logits = vec![0f32; VV];
     let mut lf = logits_out.map(|p| std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(p).unwrap()));
@@ -1205,7 +1681,6 @@ fn main() {
         generated.push(tk);
         if j + 1 < ngen {
             embed_rows(&model, &[tk], &mut b.h);
-            t = tick();
             forward(&model, &pool, &mut nc, &mut b, 1);
             t = tick();
         }
