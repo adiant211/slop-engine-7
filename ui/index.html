@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SmolLM2 chat</title>
+<style>
+  :root { color-scheme: light dark; --bg:#f6f6f4; --fg:#1c1c1a; --muted:#6b6b66; --card:#ffffff; --line:#dcdcd6; --me:#e4ecf7; --accent:#2f5fb3; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#161615; --fg:#e8e8e4; --muted:#9a9a93; --card:#20201f; --line:#35352f; --me:#26344a; --accent:#7fa6e6; } }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.5 system-ui, sans-serif; }
+  main { max-width:760px; margin:0 auto; padding:16px; display:flex; flex-direction:column; min-height:100vh; }
+  header { display:flex; align-items:baseline; justify-content:space-between; gap:12px; flex-wrap:wrap; }
+  h1 { font-size:1.15rem; margin:0; }
+  .muted { color:var(--muted); font-size:.85rem; }
+  #log { flex:1; padding:12px 0; display:flex; flex-direction:column; gap:10px; }
+  .msg { padding:10px 14px; border:1px solid var(--line); border-radius:12px; background:var(--card); white-space:pre-wrap; overflow-wrap:anywhere; }
+  .msg.user { background:var(--me); align-self:flex-end; max-width:90%; }
+  .msg.err { border-color:#c0392b; color:#c0392b; }
+  form { display:flex; gap:8px; align-items:flex-end; position:sticky; bottom:0; background:var(--bg); padding:8px 0 4px; }
+  textarea { flex:1; resize:none; min-height:44px; max-height:200px; padding:10px 12px; border:1px solid var(--line); border-radius:10px; background:var(--card); color:var(--fg); font:inherit; }
+  button, select { padding:10px 14px; border:1px solid var(--line); border-radius:10px; background:var(--card); color:var(--fg); font:inherit; cursor:pointer; }
+  button.go { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button:disabled { opacity:.5; cursor:default; }
+  .bar { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>SmolLM2-135M-Instruct</h1>
+    <div class="bar">
+      <label class="muted">max reply
+        <select id="max"><option>128</option><option selected>256</option><option>512</option><option>1024</option></select> tokens
+      </label>
+      <button id="clear" type="button">New chat</button>
+    </div>
+  </header>
+  <div id="log"></div>
+  <div class="muted" id="status">Runs locally on your CPU. Replies are greedy, so the same chat always gives the same answer.</div>
+  <form id="f">
+    <textarea id="t" rows="1" placeholder="Message (Enter sends, Shift+Enter for a new line)" autofocus></textarea>
+    <button class="go" id="send">Send</button>
+  </form>
+</main>
+<script>
+const SYSTEM = "You are a helpful AI assistant named SmolLM, trained by Hugging Face";
+const LIMIT = 6000; // characters of history sent along (the model reads about 2k tokens well)
+let hist = [];
+const log = document.getElementById("log"), t = document.getElementById("t"), send = document.getElementById("send"), status = document.getElementById("status");
+
+function add(cls, text) {
+  const d = document.createElement("div");
+  d.className = "msg " + cls;
+  d.textContent = text;
+  log.appendChild(d);
+  d.scrollIntoView({block: "end"});
+  return d;
+}
+
+function chatml() {
+  let from = hist.length, size = 0;
+  for (let i = hist.length - 1; i >= 0; i--) {
+    size += hist[i].c.length;
+    if (size > LIMIT && i < hist.length - 1) break;
+    from = i;
+  }
+  if (hist[from].r !== "user") from++;
+  let p = "<|im_start|>system\n" + SYSTEM + "<|im_end|>\n";
+  for (const m of hist.slice(from)) p += "<|im_start|>" + m.r + "\n" + m.c + "<|im_end|>\n";
+  return p + "<|im_start|>assistant\n";
+}
+
+async function submit() {
+  const text = t.value.trim();
+  if (!text || send.disabled) return;
+  t.value = "";
+  hist.push({r: "user", c: text});
+  add("user", text);
+  const pending = add("bot", "…");
+  send.disabled = true;
+  const t0 = performance.now();
+  status.textContent = "Thinking…";
+  try {
+    const r = await fetch("/gen?n=" + document.getElementById("max").value, {method: "POST", body: chatml()});
+    const reply = await r.text();
+    if (!r.ok) throw new Error(reply);
+    pending.textContent = reply || "(empty reply)";
+    hist.push({r: "assistant", c: reply});
+    status.textContent = "Done in " + ((performance.now() - t0) / 1000).toFixed(1) + " s.";
+  } catch (e) {
+    pending.className = "msg err";
+    pending.textContent = String(e.message || e);
+    hist.pop();
+    status.textContent = "Failed.";
+  }
+  send.disabled = false;
+  t.focus();
+  pending.scrollIntoView({block: "end"});
+}
+
+document.getElementById("f").addEventListener("submit", e => { e.preventDefault(); submit(); });
+t.addEventListener("keydown", e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); submit(); } });
+t.addEventListener("input", () => { t.style.height = "auto"; t.style.height = Math.min(t.scrollHeight, 200) + "px"; });
+document.getElementById("clear").addEventListener("click", () => { hist = []; log.textContent = ""; status.textContent = "New chat."; t.focus(); });
+</script>
+</body>
+</html>
