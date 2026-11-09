@@ -16,3 +16,8 @@ panic = "abort"
 [dependencies]
 safetensors = "0.4"
 tokenizers = "0.21"
+
+[profile.fast]
+inherits = "release"
+lto = false
+codegen-units = 16
