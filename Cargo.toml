@@ -1,0 +1,18 @@
+[package]
+name = "smol"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "smol"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[dependencies]
+safetensors = "0.4"
+tokenizers = "0.21"
