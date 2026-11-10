@@ -1,4 +1,4 @@
-# SmolLM2-135M-Instruct CPU engine
+# slop engine 6
 
 Yet another slop vibe coded engine! Written in Rust, overnight.
 
