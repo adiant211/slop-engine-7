@@ -1584,7 +1584,9 @@ fn main() {
     }
     let nt = nt.clamp(1, MAXT);
     let pool = Pool::new(nt);
+    let t_load = std::time::Instant::now();
     let model = load_model(&model_dir, &pool);
+    let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
 
     if mode == "ppl" {
         let ids = read_u32s(&tokens_in.expect("--tokens required"));
@@ -1659,12 +1661,15 @@ fn main() {
     let mut generated: Vec<u32> = Vec::with_capacity(ngen);
     let mut off = 0;
     let mut m = 0;
+    let t_pre = std::time::Instant::now();
     while off < plen {
         m = msz.min(plen - off);
         embed_rows(&model, &ctx_ids[off..off + m], &mut b.h);
         forward(&model, &pool, &mut nc, &mut b, m);
         off += m;
     }
+    let pre_ms = t_pre.elapsed().as_secs_f64() * 1e3;
+    let t_dec = std::time::Instant::now();
     let mut t = tick();
     for j in 0..ngen {
         // the row that predicts token j: the prompt's last row, then each fed token's row
@@ -1685,8 +1690,13 @@ fn main() {
             t = tick();
         }
     }
+    let dec_ms = t_dec.elapsed().as_secs_f64() * 1e3;
     if let Some(f) = &mut lf {
         f.flush().unwrap();
+    }
+    // SMOL_STATS=1: one line on stderr with the time of each phase (model load, prompt, generated tokens)
+    if std::env::var("SMOL_STATS").is_ok() {
+        eprintln!("SMOL_STATS load_ms={:.1} prompt_tokens={} prefill_ms={:.1} gen_tokens={} decode_ms={:.1}", load_ms, plen, pre_ms, ngen, dec_ms);
     }
     if let Some(to) = tokens_out {
         let mut all = prompt_ids.clone();

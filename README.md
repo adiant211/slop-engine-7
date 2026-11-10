@@ -18,8 +18,13 @@ into `./model` (about 270 MB, skipped when already there), builds with `cargo bu
 Settings by environment variable: `PORT`, `HOST` (default `127.0.0.1`; the page has no login), `MODEL_DIR`,
 `HF_REPO`, `HF_ENDPOINT`, `HF_TOKEN`. Needs Linux x86-64 and a Rust toolchain; on Windows use WSL.
 
-Every message runs `smol gen` once (a few rounds with a growing token limit until the model ends its turn), so a
-reply costs about half a second of model loading plus generation at roughly 100-300 tokens per second.
+Every message runs `smol gen` (a few rounds with a growing token limit until the model ends its turn), so a
+reply costs a fraction of a second of model loading plus generation at roughly 100-300 tokens per second.
+
+Under each reply the page prints its speed: prompt tokens and prefill tok/s, reply tokens and decode tok/s,
+model load time, total time (and how many engine runs it took), and the end-to-end rate (reply tokens over total
+time). The numbers come from `SMOL_STATS=1`, which makes `smol gen` print one line of per-phase timings on
+stderr; the server sets it and sends the result in an `X-Stats` response header.
 
 ## Command line
 

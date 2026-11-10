@@ -17,6 +17,8 @@
   .msg { padding:10px 14px; border:1px solid var(--line); border-radius:12px; background:var(--card); white-space:pre-wrap; overflow-wrap:anywhere; }
   .msg.user { background:var(--me); align-self:flex-end; max-width:90%; }
   .msg.err { border-color:#c0392b; color:#c0392b; }
+  .stats { color:var(--muted); font:.78rem/1.4 ui-monospace, Consolas, monospace; margin:-4px 4px 2px; overflow-wrap:anywhere; }
+  .stats b { color:var(--fg); font-weight:600; }
   form { display:flex; gap:8px; align-items:flex-end; position:sticky; bottom:0; background:var(--bg); padding:8px 0 4px; }
   textarea { flex:1; resize:none; min-height:44px; max-height:200px; padding:10px 12px; border:1px solid var(--line); border-radius:10px; background:var(--card); color:var(--fg); font:inherit; }
   button, select { padding:10px 14px; border:1px solid var(--line); border-radius:10px; background:var(--card); color:var(--fg); font:inherit; cursor:pointer; }
@@ -58,6 +60,34 @@ function add(cls, text) {
   return d;
 }
 
+// X-Stats: prompt=..;gen=..;rounds=..;decode_tokens=..;load_ms=..;prefill_ms=..;decode_ms=..;total_ms=..
+function showStats(after, header) {
+  if (!header) return;
+  const s = {};
+  for (const kv of header.split(";")) { const [k, v] = kv.split("="); s[k] = parseFloat(v); }
+  const rate = (tokens, ms) => ms > 0 ? (tokens / ms * 1000).toFixed(0) : "–";
+  const parts = [
+    ["prompt", s.prompt + " tok"],
+    ["prefill", rate(s.prompt, s.prefill_ms) + " tok/s"],
+    ["reply", s.gen + " tok"],
+    ["decode", rate(s.decode_tokens, s.decode_ms) + " tok/s"],
+    ["load", (s.load_ms / 1000).toFixed(2) + " s"],
+    ["total", (s.total_ms / 1000).toFixed(2) + " s" + (s.rounds > 1 ? " (" + s.rounds + " runs)" : "")],
+    ["end to end", s.total_ms > 0 ? (s.gen / s.total_ms * 1000).toFixed(1) + " tok/s" : "–"],
+  ];
+  const d = document.createElement("div");
+  d.className = "stats";
+  parts.forEach(([name, val], i) => {
+    if (i) d.appendChild(document.createTextNode(" · "));
+    d.appendChild(document.createTextNode(name + " "));
+    const b = document.createElement("b");
+    b.textContent = val;
+    d.appendChild(b);
+  });
+  after.after(d);
+  d.scrollIntoView({block: "end"});
+}
+
 function chatml() {
   let from = hist.length, size = 0;
   for (let i = hist.length - 1; i >= 0; i--) {
@@ -88,6 +118,7 @@ async function submit() {
     pending.textContent = reply || "(empty reply)";
     hist.push({r: "assistant", c: reply});
     status.textContent = "Done in " + ((performance.now() - t0) / 1000).toFixed(1) + " s.";
+    showStats(pending, r.headers.get("X-Stats"));
   } catch (e) {
     pending.className = "msg err";
     pending.textContent = String(e.message || e);

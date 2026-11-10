@@ -3,7 +3,8 @@
 //   smol-ui [--model DIR] [--host ADDR] [--port N] [--engine PATH]
 //
 // GET  /          the chat page (ui/index.html, compiled in)
-// POST /gen?n=N   body = a complete ChatML prompt (the page builds it) -> the assistant's reply as plain text
+// POST /gen?n=N   body = a complete ChatML prompt (the page builds it) -> the assistant's reply as plain text,
+//                 with an X-Stats header: token counts and the time of each phase (see `generate`)
 //
 // The engine always produces exactly N tokens and does not stop at the end-of-turn token, so the reply is
 // generated with a small N first and N is doubled (up to the limit) until <|im_end|> shows up. Greedy decoding
@@ -14,11 +15,13 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const PAGE: &str = include_str!("../../ui/index.html");
 const MAX_BODY: usize = 1 << 20;
 const MAX_TOKENS: usize = 1024;
+// SmolLM2 special tokens that end a reply: <|endoftext|> and <|im_end|>
+const STOP_IDS: [u32; 2] = [0, 2];
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 struct Config {
@@ -74,6 +77,11 @@ fn die(msg: &str) -> ! {
 }
 
 fn reply(s: &mut TcpStream, code: u16, ctype: &str, body: &[u8]) -> std::io::Result<()> {
+    reply_with(s, code, ctype, "", body)
+}
+
+// extra: more header lines, each ending in \r\n
+fn reply_with(s: &mut TcpStream, code: u16, ctype: &str, extra: &str, body: &[u8]) -> std::io::Result<()> {
     let status = match code {
         200 => "OK",
         400 => "Bad Request",
@@ -81,7 +89,7 @@ fn reply(s: &mut TcpStream, code: u16, ctype: &str, body: &[u8]) -> std::io::Res
         413 => "Payload Too Large",
         _ => "Internal Server Error",
     };
-    write!(s, "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n", code, status, ctype, body.len())?;
+    write!(s, "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\n{}Connection: close\r\n\r\n", code, status, ctype, body.len(), extra)?;
     s.write_all(body)?;
     s.flush()
 }
@@ -129,7 +137,13 @@ fn handle(mut s: TcpStream, cfg: &Config, gate: &Mutex<()>) -> std::io::Result<(
                 .clamp(1, MAX_TOKENS);
             let _turn = gate.lock().unwrap_or_else(|e| e.into_inner());
             match generate(cfg, &body, n) {
-                Ok(text) => reply(&mut s, 200, "text/plain; charset=utf-8", text.as_bytes()),
+                Ok(g) => {
+                    let stats = format!(
+                        "X-Stats: prompt={};gen={};rounds={};decode_tokens={};load_ms={:.1};prefill_ms={:.1};decode_ms={:.1};total_ms={:.1}\r\n",
+                        g.prompt, g.gen, g.rounds, g.decode_tokens, g.load_ms, g.prefill_ms, g.decode_ms, g.total_ms
+                    );
+                    reply_with(&mut s, 200, "text/plain; charset=utf-8", &stats, g.text.as_bytes())
+                }
                 Err(e) => reply(&mut s, 500, "text/plain; charset=utf-8", e.as_bytes()),
             }
         }
@@ -137,34 +151,87 @@ fn handle(mut s: TcpStream, cfg: &Config, gate: &Mutex<()>) -> std::io::Result<(
     }
 }
 
-fn generate(cfg: &Config, prompt: &[u8], max: usize) -> Result<String, String> {
-    let file = std::env::temp_dir().join(format!("smol-ui-{}-{}.txt", std::process::id(), COUNTER.fetch_add(1, Ordering::Relaxed)));
+// What one request cost. The phase times come from the last engine run (it ran the prompt once and then
+// decoded `decode_tokens` tokens, of which `gen` belong to the reply); `total_ms` covers every round.
+struct Generated {
+    text: String,
+    prompt: usize,      // prompt tokens
+    gen: usize,         // reply tokens (up to the end-of-turn token)
+    decode_tokens: usize, // tokens the last engine run decoded
+    rounds: usize,
+    load_ms: f64,
+    prefill_ms: f64,
+    decode_ms: f64,
+    total_ms: f64,
+}
+
+fn stat(line: &str, key: &str) -> f64 {
+    line.split_whitespace()
+        .find_map(|kv| kv.strip_prefix(key).and_then(|v| v.strip_prefix('=')))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.0)
+}
+
+fn generate(cfg: &Config, prompt: &[u8], max: usize) -> Result<Generated, String> {
+    let started = Instant::now();
+    let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = std::env::temp_dir();
+    let file = tmp.join(format!("smol-ui-{}-{}.txt", std::process::id(), id));
+    let toks = tmp.join(format!("smol-ui-{}-{}.tok", std::process::id(), id));
     std::fs::write(&file, prompt).map_err(|e| format!("cannot write prompt file: {}", e))?;
     let mut n = 48.min(max);
+    let mut rounds = 0;
     let result = loop {
+        rounds += 1;
         let out = Command::new(&cfg.engine)
             .args(["gen", "--model", &cfg.model, "--prompt-file"])
             .arg(&file)
-            .args(["--n", &n.to_string()])
+            .args(["--n", &n.to_string(), "--tokens-out"])
+            .arg(&toks)
+            .env("SMOL_STATS", "1")
             .output();
         let out = match out {
             Ok(o) => o,
             Err(e) => break Err(format!("cannot run the engine: {}", e)),
         };
+        let err = String::from_utf8_lossy(&out.stderr).into_owned();
         if !out.status.success() {
-            let err = String::from_utf8_lossy(&out.stderr);
             break Err(format!("engine failed: {}", err.lines().last().unwrap_or("")));
         }
         let text = String::from_utf8_lossy(&out.stdout).into_owned();
         let stop = ["<|im_end|>", "<|endoftext|>"].iter().filter_map(|m| text.find(m)).min();
-        if let Some(at) = stop {
-            break Ok(text[..at].trim().to_string());
-        }
-        if n >= max {
-            break Ok(text.trim_end().to_string());
+        if stop.is_some() || n >= max {
+            let text = match stop {
+                Some(at) => text[..at].trim().to_string(),
+                None => text.trim_end().to_string(),
+            };
+            // token counts from the engine's token file: prompt followed by the n generated tokens
+            let ids: Vec<u32> = std::fs::read(&toks)
+                .unwrap_or_default()
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            let plen = ids.len().saturating_sub(n);
+            let gen = ids[plen..].iter().position(|t| STOP_IDS.contains(t)).unwrap_or(n);
+            let line = err.lines().find(|l| l.starts_with("SMOL_STATS")).unwrap_or("");
+            break Ok(Generated {
+                text,
+                prompt: plen,
+                gen,
+                decode_tokens: n,
+                rounds,
+                load_ms: stat(line, "load_ms"),
+                prefill_ms: stat(line, "prefill_ms"),
+                decode_ms: stat(line, "decode_ms"),
+                total_ms: 0.0,
+            });
         }
         n = (n * 2).min(max);
     };
     let _ = std::fs::remove_file(&file);
-    result
+    let _ = std::fs::remove_file(&toks);
+    result.map(|mut g| {
+        g.total_ms = started.elapsed().as_secs_f64() * 1e3;
+        g
+    })
 }
