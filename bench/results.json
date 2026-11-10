@@ -1,0 +1,145 @@
+{
+ "cpu": "AMD Ryzen 5 5600X 6-Core Processor",
+ "torch": "2.15.0+cpu",
+ "transformers": "5.22.2",
+ "tokens": 128,
+ "runs": 5,
+ "threads": 4,
+ "prompts": {
+  "chat0": {
+   "smol_1": {
+    "load_ms": 142.4,
+    "prefill_tok_s": 590.84,
+    "decode_tok_s": 180.23,
+    "total_ms": 956.19,
+    "prompt_tokens": 40
+   },
+   "smol_mt": {
+    "load_ms": 34.9,
+    "prefill_tok_s": 1398.6,
+    "decode_tok_s": 262.03,
+    "total_ms": 604.65,
+    "prompt_tokens": 40
+   }
+  },
+  "chat1": {
+   "smol_1": {
+    "load_ms": 136.8,
+    "prefill_tok_s": 617.82,
+    "decode_tok_s": 183.22,
+    "total_ms": 920.01,
+    "prompt_tokens": 43
+   },
+   "torch_1": {
+    "load_ms": 246.11,
+    "prefill_tok_s": 199.33,
+    "decode_tok_s": 25.52,
+    "total_ms": 5543.52,
+    "prompt_tokens": 43
+   },
+   "same_leading_tokens_1": 5,
+   "smol_mt": {
+    "load_ms": 41.4,
+    "prefill_tok_s": 1201.12,
+    "decode_tok_s": 248.3,
+    "total_ms": 663.62,
+    "prompt_tokens": 43
+   },
+   "torch_mt": {
+    "load_ms": 209.47,
+    "prefill_tok_s": 438.63,
+    "decode_tok_s": 23.09,
+    "total_ms": 5810.81,
+    "prompt_tokens": 43
+   },
+   "same_leading_tokens_mt": 5
+  },
+  "chat2": {
+   "smol_1": {
+    "load_ms": 142.3,
+    "prefill_tok_s": 565.77,
+    "decode_tok_s": 169.78,
+    "total_ms": 977.31,
+    "prompt_tokens": 40
+   },
+   "smol_mt": {
+    "load_ms": 40.8,
+    "prefill_tok_s": 1234.57,
+    "decode_tok_s": 246.3,
+    "total_ms": 646.58,
+    "prompt_tokens": 40
+   }
+  },
+  "chat3": {
+   "smol_1": {
+    "load_ms": 141.7,
+    "prefill_tok_s": 559.44,
+    "decode_tok_s": 154.44,
+    "total_ms": 1054.02,
+    "prompt_tokens": 40
+   },
+   "smol_mt": {
+    "load_ms": 41.5,
+    "prefill_tok_s": 1201.2,
+    "decode_tok_s": 196.68,
+    "total_ms": 841.25,
+    "prompt_tokens": 40
+   }
+  },
+  "short": {
+   "smol_1": {
+    "load_ms": 159.5,
+    "prefill_tok_s": 275.86,
+    "decode_tok_s": 159.5,
+    "total_ms": 1030.27,
+    "prompt_tokens": 4
+   },
+   "smol_mt": {
+    "load_ms": 43.3,
+    "prefill_tok_s": 506.33,
+    "decode_tok_s": 194.59,
+    "total_ms": 799.43,
+    "prompt_tokens": 4
+   }
+  },
+  "long": {
+   "smol_1": {
+    "load_ms": 174.0,
+    "prefill_tok_s": 453.17,
+    "decode_tok_s": 123.35,
+    "total_ms": 3486.12,
+    "prompt_tokens": 1005
+   },
+   "torch_1": {
+    "load_ms": 246.61,
+    "prefill_tok_s": 231.83,
+    "decode_tok_s": 19.58,
+    "total_ms": 11316.17,
+    "prompt_tokens": 1005
+   },
+   "same_leading_tokens_1": 7,
+   "smol_mt": {
+    "load_ms": 37.8,
+    "prefill_tok_s": 1121.65,
+    "decode_tok_s": 198.17,
+    "total_ms": 1608.36,
+    "prompt_tokens": 1005
+   },
+   "torch_mt": {
+    "load_ms": 237.59,
+    "prefill_tok_s": 560.66,
+    "decode_tok_s": 19.09,
+    "total_ms": 8598.38,
+    "prompt_tokens": 1005
+   },
+   "same_leading_tokens_mt": 7
+  }
+ },
+ "accuracy": {
+  "tokens": 1024,
+  "ppl_torch": 11.076,
+  "ppl_smol": 11.095,
+  "top1_agreement": 0.9844,
+  "mean_kld": 0.00072
+ }
+}
