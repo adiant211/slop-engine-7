@@ -139,6 +139,8 @@ fn dump_stats() {
             s += &format!("{}={:.1}% ", names[i], v as f64 * 100.0 / tot.max(1) as f64);
         }
         eprintln!("STATS total {:.0} Mcyc: {}", tot as f64 / 1e6, s);
+        let nb: Vec<u64> = NIB_STATS.iter().map(|a| a.load(Ordering::Relaxed)).collect();
+        eprintln!("HEAD 4-bit passes {} candidates/pass {:.1} fallbacks {}", nb[0], nb[1] as f64 / nb[0].max(1) as f64, nb[2]);
     }
 }
 
@@ -176,6 +178,28 @@ impl<T> PM<T> {
 
 extern "C" {
     fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
+    fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+    fn _exit(code: i32) -> !;
+}
+
+// The whole file, read-only: mapped straight from the page cache (no copy, no page faults later); falls
+// back to reading it into memory.
+fn map_file(path: &str) -> &'static [u8] {
+    use std::os::unix::io::AsRawFd;
+    let fail = |e: std::io::Error| -> ! {
+        eprintln!("cannot read {}: {}", path, e);
+        std::process::exit(1)
+    };
+    let f = std::fs::File::open(path).unwrap_or_else(|e| fail(e));
+    let len = f.metadata().map(|m| m.len() as usize).unwrap_or(0);
+    if len > 0 {
+        // PROT_READ, MAP_PRIVATE | MAP_POPULATE
+        let p = unsafe { mmap(std::ptr::null_mut(), len, 1, 2 | 0x8000, f.as_raw_fd(), 0) };
+        if p as isize != -1 && !p.is_null() {
+            return unsafe { std::slice::from_raw_parts(p, len) };
+        }
+    }
+    Vec::leak(std::fs::read(path).unwrap_or_else(|e| fail(e)))
 }
 
 // 2 MB-aligned block that asks for transparent huge pages; lives for the whole process.
@@ -353,35 +377,72 @@ unsafe fn bf16x8(p: *const u16) -> __m256 {
 unsafe fn quant_w_row(src: *const u16, k: usize, dst: *mut u8, low: *mut u8) -> f32 {
     let absm = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fff_ffff));
     let mut mx = _mm256_setzero_ps();
+    let mut mx2 = _mm256_setzero_ps();
     let mut i = 0;
     while i < k {
         mx = _mm256_max_ps(mx, _mm256_and_ps(bf16x8(src.add(i)), absm));
-        i += 8;
+        mx2 = _mm256_max_ps(mx2, _mm256_and_ps(bf16x8(src.add(i + 8)), absm));
+        i += 16;
     }
-    let m = hmax(mx);
+    let m = hmax(_mm256_max_ps(mx, mx2));
     let s = if m > 0.0 { m / 127.0 } else { 1.0 };
+    quant_w_row_s(src, k, s, dst, low);
+    s
+}
+
+// The same with the row's scale given. dst (the int8 plane) or low (the low bytes) may be null: that
+// plane is not written. A 32-byte aligned dst is written past the caches (it is read back much later).
+#[inline(always)]
+unsafe fn quant_w_row_s(src: *const u16, k: usize, s: f32, dst: *mut u8, low: *mut u8) {
     let inv = _mm256_set1_ps(1.0 / s);
     let lim = _mm256_set1_ps(127.0);
     let nlim = _mm256_set1_ps(-127.0);
     let idx = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
     let mut i = 0;
     let c256 = _mm256_set1_ps(256.0);
+    let (hi, lo) = (!dst.is_null(), !low.is_null());
+    // (only the matrices that also write low bytes: the head's rows are read back at once for nib_row)
+    let stream = NT_STORE && lo && (dst as usize) & 31 == 0;
     while i < k {
         let mut v = [_mm256_setzero_si256(); 4];
         let mut r = [_mm256_setzero_si256(); 4];
         for t in 0..4 {
             let f = _mm256_max_ps(_mm256_min_ps(_mm256_mul_ps(bf16x8(src.add(i + t * 8)), inv), lim), nlim);
             v[t] = _mm256_cvtps_epi32(f);
-            let d = _mm256_mul_ps(_mm256_sub_ps(f, _mm256_cvtepi32_ps(v[t])), c256);
-            r[t] = _mm256_cvtps_epi32(_mm256_max_ps(_mm256_min_ps(d, lim), nlim));
+            if lo {
+                let d = _mm256_mul_ps(_mm256_sub_ps(f, _mm256_cvtepi32_ps(v[t])), c256);
+                r[t] = _mm256_cvtps_epi32(_mm256_max_ps(_mm256_min_ps(d, lim), nlim));
+            }
         }
-        let b = _mm256_packs_epi16(_mm256_packs_epi32(v[0], v[1]), _mm256_packs_epi32(v[2], v[3]));
-        _mm256_storeu_si256(dst.add(i) as *mut __m256i, _mm256_permutevar8x32_epi32(b, idx));
-        let b = _mm256_packs_epi16(_mm256_packs_epi32(r[0], r[1]), _mm256_packs_epi32(r[2], r[3]));
-        _mm256_storeu_si256(low.add(i) as *mut __m256i, _mm256_permutevar8x32_epi32(b, idx));
+        if hi {
+            let b = _mm256_packs_epi16(_mm256_packs_epi32(v[0], v[1]), _mm256_packs_epi32(v[2], v[3]));
+            let b = _mm256_permutevar8x32_epi32(b, idx);
+            if stream {
+                _mm256_stream_si256(dst.add(i) as *mut __m256i, b);
+            } else {
+                _mm256_storeu_si256(dst.add(i) as *mut __m256i, b);
+            }
+        }
+        if lo {
+            let b = _mm256_packs_epi16(_mm256_packs_epi32(r[0], r[1]), _mm256_packs_epi32(r[2], r[3]));
+            _mm256_storeu_si256(low.add(i) as *mut __m256i, _mm256_permutevar8x32_epi32(b, idx));
+        }
         i += 32;
     }
-    s
+}
+const NT_STORE: bool = true;
+
+// 16 rows of 16 bytes -> 16 columns (out[c][i] = rows[i][c]): four perfect shuffles of the 256 bytes.
+#[inline(always)]
+unsafe fn transpose16(x: &mut [__m128i; 16]) {
+    for _ in 0..4 {
+        let mut y = *x;
+        for i in 0..8 {
+            y[2 * i] = _mm_unpacklo_epi8(x[i], x[i + 8]);
+            y[2 * i + 1] = _mm_unpackhi_epi8(x[i], x[i + 8]);
+        }
+        *x = y;
+    }
 }
 
 // One activation row (k f32, k % 16 == 0) -> int16 in [-qm, qm]; returns the scale (0 for an all-zero row).
@@ -467,9 +528,26 @@ struct Mat {
     part: [P<u8>; MAXT],
     lo: [usize; MAXT + 1],
     low: P<u8>, // low bytes: column-major [k][n] for the layer matrices, row-major [n][k] for the head
+    // (null when the matrix never uses them)
+    // head only: its low rows are made on first use from the bf16 rows at src; lazy[row] != 0 once made
+    src: P<u16>,
+    lazy: PM<u8>,
+    nib: P<u8>, // head only (may be null): 4-bit plane [n][NB], see nib_row
 }
 
-const PF_DIST: usize = 4096; // weights are asked for this many bytes ahead of the row being read
+// Low bytes of head row i (made now if this is its first use).
+#[inline(always)]
+unsafe fn head_low(w: &Mat, i: usize) -> *const u8 {
+    let lr = w.low.get().add(i * H) as *mut u8;
+    let f = w.lazy.get().add(i);
+    if *f == 0 {
+        quant_w_row_s(w.src.get().add(i * H), H, *w.sc.as_ptr().add(i), std::ptr::null_mut(), lr);
+        *f = 1;
+    }
+    lr
+}
+
+const PF_DIST: usize = 1536; // weights are asked for this many bytes ahead of the row being read (measured: 1-2 KB is best on one core)
 
 // corr[i] = sum over the selected columns of low[col][i] * x[col], for `rows` rows of this thread's share.
 // lowc points at column 0, first row of the share; columns are n bytes apart. corr needs rows + 16 slots.
@@ -667,7 +745,7 @@ unsafe fn head_finish(w: &Mat, tid: usize, xq: *const i16, xs: f32, logits: *mut
         }
         if nh > 56 || j >= hi {
             for &(i, _) in &hits[..nh] {
-                let lr = low.add(i * H);
+                let lr = if *w.lazy.get().add(i) != 0 { low.add(i * H) } else { w.src.get().add(i * H) as *const u8 };
                 let mut c = 0;
                 while c < H {
                     _mm_prefetch::<_MM_HINT_T0>(lr.add(c) as *const i8);
@@ -675,7 +753,7 @@ unsafe fn head_finish(w: &Mat, tid: usize, xq: *const i16, xs: f32, logits: *mut
                 }
             }
             for &(i, d) in &hits[..nh] {
-                let v = fin1(d, dot_row(low.add(i * H), xq, H), *sc.add(i), xs256);
+                let v = fin1(d, dot_row(head_low(w, i), xq, H), *sc.add(i), xs256);
                 *logits.add(i) = v;
                 if v > bv {
                     bv = v;
@@ -793,7 +871,8 @@ fn matmul(pool: &Pool, w: &Mat, xq: *const i16, xs: *const f32, m: usize, out: *
         }
         let wp = w.part[tid].get();
         let sc = w.sc.as_ptr().add(lo);
-        let (rows, sel) = (hi - lo, psel.get());
+        // no low plane: plain products (the same values as a correction of zero)
+        let (rows, sel) = (hi - lo, if w.low.get().is_null() { std::ptr::null() } else { psel.get() });
         let lowc = if sel.is_null() { std::ptr::null() } else { w.low.get().add(lo) };
         if m == 1 {
             if w.k == H {
@@ -846,7 +925,7 @@ unsafe fn head_refine(w: &Mat, tid: usize, xq: *const i16, xs: f32, logits: *mut
             }
             for &i in &hits[..nh] {
                 let d = dot_row(base.add((i - lo) * H), xq, H);
-                let l = dot_row(low.add(i * H), xq, H);
+                let l = dot_row(head_low(w, i), xq, H);
                 let v = fin1(d, l, *sc.add(i), xs256);
                 *logits.add(i) = v;
                 if v > bv {
@@ -962,6 +1041,174 @@ fn head_rows(pool: &Pool, w: &Mat, xq: *const i16, xs: *const f32, m: usize, log
     });
 }
 
+// ---------------------------------------------------------------- 4-bit head (greedy decoding)
+// The head is a fifth of the bytes a token reads, and greedy decoding only wants its best row. A first pass
+// over a 4-bit plane (the high nibble of every int8 weight, half the bytes) brackets every logit; only the
+// rows whose bracket reaches the best lower bound are then computed exactly, from the same int8 rows and
+// low bytes as head_argmax, so the token is the same.
+const NB: usize = H / 2; // bytes per row of the 4-bit plane
+// Bracket half-width, in standard deviations of the dropped low nibbles. The best row is lost only if its
+// error and a rival's differ by two half-widths, i.e. by 6.4 standard deviations of that difference.
+const NIB_M: f64 = 4.5;
+static NIB_STATS: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)]; // calls, candidates, fallbacks
+
+// One int8 row -> high nibbles biased to 0..15 (floor(q / 16) + 8). Each 32-byte block covers 64 columns:
+// its 16-bit word w holds columns w, 16 + w, 32 + w, 48 + w, lowest nibble first.
+#[inline(always)]
+unsafe fn nib_row(q: *const u8, out: *mut u8) {
+    let bias = _mm256_set1_epi8(-128i8);
+    let m = _mm256_set1_epi8(0x0f);
+    for b in 0..H / 64 {
+        let a = _mm256_xor_si256(_mm256_loadu_si256(q.add(b * 64) as *const __m256i), bias);
+        let c = _mm256_xor_si256(_mm256_loadu_si256(q.add(b * 64 + 32) as *const __m256i), bias);
+        let a = _mm256_and_si256(_mm256_srli_epi16::<4>(a), m);
+        let c = _mm256_and_si256(_mm256_srli_epi16::<4>(c), m);
+        let e = _mm_or_si128(_mm256_castsi256_si128(a), _mm_slli_epi16::<4>(_mm256_extracti128_si256::<1>(a)));
+        let o = _mm_or_si128(_mm256_castsi256_si128(c), _mm_slli_epi16::<4>(_mm256_extracti128_si256::<1>(c)));
+        _mm_storeu_si128(out.add(b * 32) as *mut __m128i, _mm_unpacklo_epi8(e, o));
+        _mm_storeu_si128(out.add(b * 32 + 16) as *mut __m128i, _mm_unpackhi_epi8(e, o));
+    }
+}
+
+// sum over the columns of nibble * x (nibbles 0..15, so the sum fits an i32)
+#[inline(always)]
+unsafe fn nib_dot(w: *const u8, x: *const i16) -> i32 {
+    let m = _mm256_set1_epi16(0x000f);
+    let mut a0 = _mm256_setzero_si256();
+    let mut a1 = _mm256_setzero_si256();
+    for b in 0..H / 64 {
+        let v = _mm256_loadu_si256(w.add(b * 32) as *const __m256i);
+        let xb = x.add(b * 64);
+        let n0 = _mm256_and_si256(v, m);
+        let n1 = _mm256_and_si256(_mm256_srli_epi16::<4>(v), m);
+        let n2 = _mm256_and_si256(_mm256_srli_epi16::<8>(v), m);
+        let n3 = _mm256_srli_epi16::<12>(v);
+        a0 = _mm256_add_epi32(a0, _mm256_madd_epi16(n0, _mm256_loadu_si256(xb as *const __m256i)));
+        a1 = _mm256_add_epi32(a1, _mm256_madd_epi16(n1, _mm256_loadu_si256(xb.add(16) as *const __m256i)));
+        a0 = _mm256_add_epi32(a0, _mm256_madd_epi16(n2, _mm256_loadu_si256(xb.add(32) as *const __m256i)));
+        a1 = _mm256_add_epi32(a1, _mm256_madd_epi16(n3, _mm256_loadu_si256(xb.add(48) as *const __m256i)));
+    }
+    hsum_i32(_mm256_add_epi32(a0, a1))
+}
+
+// Greedy token for one activation row, or None when the caller should run head_argmax instead.
+fn head_fast(pool: &Pool, w: &Mat, xq: *const i16, xs: f32, u: *mut i32, cands: &mut Vec<(u32, i32, f32)>) -> Option<u32> {
+    if w.nib.get().is_null() || !(xs > 0.0) || !xs.is_finite() {
+        return None;
+    }
+    NIB_STATS[0].fetch_add(1, Ordering::Relaxed);
+    let r = head_fast_in(pool, w, xq, xs, u, cands);
+    NIB_STATS[1].fetch_add(cands.len() as u64, Ordering::Relaxed);
+    if r.is_none() {
+        NIB_STATS[2].fetch_add(1, Ordering::Relaxed);
+    }
+    r
+}
+
+fn head_fast_in(pool: &Pool, w: &Mat, xq: *const i16, xs: f32, u: *mut i32, cands: &mut Vec<(u32, i32, f32)>) -> Option<u32> {
+    // q . x = 16 * (nib . x) - 128 * sum(x) + low . x, low in 0..15: centred, low . x = 7.5 * sum(x) + err,
+    // err a sum of independent terms within +-7.5 |x_c| (standard deviation 4.61 |x_c|)
+    let (mut s1, mut sa, mut s2) = (0i64, 0i64, 0i64);
+    for c in 0..H {
+        let v = unsafe { *xq.add(c) } as i64;
+        s1 += v;
+        sa += v.abs();
+        s2 += v * v;
+    }
+    let e = (NIB_M * 4.62 * (s2 as f64).sqrt()).min(7.5 * sa as f64) as f32 + 4096.0;
+    let off = -120.5 * s1 as f32;
+    let mut lbs = [f32::NEG_INFINITY; MAXT];
+    let (px, pu, pw, pl) = (P(xq), PM(u), P(w as *const Mat), PM(lbs.as_mut_ptr()));
+    pool.run(move |tid| unsafe {
+        let w = &*pw.get();
+        let (nib, sc, x) = (w.nib.get(), w.sc.as_ptr(), px.get());
+        let mut best = f32::NEG_INFINITY;
+        for j in w.lo[tid]..w.lo[tid + 1] {
+            let wr = nib.add(j * NB);
+            let mut c = 0;
+            while c < NB {
+                _mm_prefetch::<_MM_HINT_T0>(wr.wrapping_add(PF_DIST + c) as *const i8);
+                c += 64;
+            }
+            let d = nib_dot(wr, x);
+            *pu.get().add(j) = d;
+            let lb = (16.0 * d as f32 + off - e) * (*sc.add(j) * xs);
+            if lb > best {
+                best = lb;
+            }
+        }
+        *pl.get().add(tid) = best;
+    });
+    let best_lb = lbs[..pool.n].iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+    cands.clear();
+    if !best_lb.is_finite() {
+        return None;
+    }
+    unsafe {
+        let sc = w.sc.as_ptr();
+        let (c16, co, xv, bl) = (_mm256_set1_ps(16.0), _mm256_set1_ps(off + e), _mm256_set1_ps(xs), _mm256_set1_ps(best_lb));
+        let mut j = 0;
+        while j < VV {
+            let d = _mm256_cvtepi32_ps(_mm256_loadu_si256(u.add(j) as *const __m256i));
+            let ub = _mm256_mul_ps(_mm256_fmadd_ps(d, c16, co), _mm256_mul_ps(_mm256_loadu_ps(sc.add(j)), xv));
+            let mut mk = _mm256_movemask_ps(_mm256_cmp_ps::<_CMP_GE_OQ>(ub, bl)) as u32;
+            while mk != 0 {
+                cands.push(((j + mk.trailing_zeros() as usize) as u32, 0, 0.0));
+                mk &= mk - 1;
+            }
+            j += 8;
+        }
+        if cands.is_empty() || cands.len() > 4000 {
+            return None;
+        }
+        let row = |i: usize| -> *const u8 {
+            let mut t = 0;
+            while i >= w.lo[t + 1] {
+                t += 1;
+            }
+            w.part[t].get().add((i - w.lo[t]) * H)
+        };
+        for cd in cands.iter() {
+            let r = row(cd.0 as usize);
+            let mut c = 0;
+            while c < H {
+                _mm_prefetch::<_MM_HINT_T0>(r.add(c) as *const i8);
+                c += 64;
+            }
+        }
+        let mut top = f32::NEG_INFINITY;
+        for cd in cands.iter_mut() {
+            let i = cd.0 as usize;
+            let d = dot_row(row(i), xq, H);
+            let v = d as f32 * (*sc.add(i) * xs);
+            *cd = (cd.0, d, v);
+            if v > top {
+                top = v;
+            }
+        }
+        if !top.is_finite() {
+            return None;
+        }
+        let thr = top - HEAD_T;
+        let xs256 = xs * (1.0 / 256.0);
+        let (mut bv, mut bi) = (f32::NEG_INFINITY, 0u32);
+        for &(i, d, v) in cands.iter() {
+            if v >= thr {
+                let r = fin1(d, dot_row(head_low(w, i as usize), xq, H), *sc.add(i as usize), xs256);
+                if r > bv {
+                    bv = r;
+                    bi = i;
+                }
+            }
+        }
+        if bv >= thr {
+            Some(bi)
+        } else {
+            None
+        }
+    }
+}
+
 // ---------------------------------------------------------------- model
 struct Layer {
     wqkv: Mat,
@@ -997,12 +1244,9 @@ impl Src {
     }
 }
 
-fn load_model(dir: &str, pool: &Pool) -> Model {
+fn load_model(dir: &str, pool: &Pool, want_nib: bool) -> Model {
     let path = format!("{}/model.safetensors", dir);
-    let data: &'static [u8] = Vec::leak(std::fs::read(&path).unwrap_or_else(|e| {
-        eprintln!("cannot read {}: {}", path, e);
-        std::process::exit(1)
-    }));
+    let data: &'static [u8] = map_file(&path);
     let st = safetensors::SafeTensors::deserialize(data).expect("bad safetensors");
     let get = |name: &str, n: usize, k: usize| -> (P<u8>, usize) {
         let t = st.tensor(name).unwrap_or_else(|e| panic!("tensor {} {:?}", name, e));
@@ -1055,19 +1299,29 @@ fn load_model(dir: &str, pool: &Pool) -> Model {
     let mut mats: Vec<Mat> = Vec::with_capacity(srcs.len());
     let mut size = [0usize; MAXT];
     // low bytes: one block, each matrix n * k bytes (+16 so 16-byte loads may run past a column)
-    let low_total: usize = srcs.iter().map(|s| s.n * s.k + 16).sum();
+    // matrices whose activations never select a column (KSEL == 0) have no low plane; the head's is
+    // filled row by row on first use (untouched pages are never backed)
+    let nsrc = srcs.len();
+    let has_low = |mi: usize| mi + 1 == nsrc || KSEL[mi % 4] > 0;
+    let low_total: usize = srcs.iter().enumerate().map(|(mi, s)| if has_low(mi) { s.n * s.k + 16 } else { 0 }).sum();
     let low_base = huge_alloc(low_total, false);
     let mut low_off = 0usize;
-    for s in &srcs {
+    for (mi, s) in srcs.iter().enumerate() {
+        let head = mi + 1 == nsrc;
         let mut mt = Mat {
             n: s.n,
             k: s.k,
             sc: vec![0f32; s.n],
             part: [P(std::ptr::null()); MAXT],
             lo: [s.n; MAXT + 1],
-            low: P(unsafe { low_base.add(low_off) } as *const u8),
+            low: P(if has_low(mi) { unsafe { low_base.add(low_off) as *const u8 } } else { std::ptr::null() }),
+            src: P(if head { s.parts[0].0.get() as *const u16 } else { std::ptr::null() }),
+            lazy: PM(if head { Vec::leak(vec![0u8; s.n]).as_mut_ptr() } else { std::ptr::null_mut() }),
+            nib: P(if head && want_nib { huge_alloc(s.n * NB + PAD, false) as *const u8 } else { std::ptr::null() }),
         };
-        low_off += s.n * s.k + 16;
+        if has_low(mi) {
+            low_off += s.n * s.k + 16;
+        }
         for t in 0..nt {
             let (lo, hi) = split(s.n, nt, t);
             mt.lo[t] = lo;
@@ -1096,22 +1350,51 @@ fn load_model(dir: &str, pool: &Pool) -> Model {
                 let sc = (*psc.get().add(mi)).get();
                 let low = mt.low.get() as *mut u8;
                 let head = mi + 1 == nm;
-                let mut tmp = [0u8; FF];
-                for r in mt.lo[tid]..mt.lo[tid + 1] {
-                    if head {
-                        *sc.add(r) = quant_w_row(s.row(r), s.k, dst, low.add(r * s.k));
-                    } else {
-                        // column-major: byte (row r, column j) at j * n + r
-                        *sc.add(r) = quant_w_row(s.row(r), s.k, dst, tmp.as_mut_ptr());
-                        let mut lp = low.add(r);
-                        for j in 0..s.k {
-                            *lp = tmp[j];
-                            lp = lp.add(s.n);
+                let mut tmp = [0u8; 16 * FF];
+                let tp = tmp.as_mut_ptr();
+                let (k, n) = (s.k, s.n);
+                let (mut r, hi) = (mt.lo[tid], mt.lo[tid + 1]);
+                while r < hi {
+                    if head || low.is_null() {
+                        *sc.add(r) = quant_w_row(s.row(r), k, dst, std::ptr::null_mut());
+                        if head && !mt.nib.get().is_null() {
+                            nib_row(dst, mt.nib.get().add(r * NB) as *mut u8);
                         }
+                        dst = dst.add(k);
+                        r += 1;
+                    } else if hi - r >= 16 {
+                        // 16 rows at a time, their low bytes turned into 16-byte column pieces
+                        // (column-major: byte (row r, column j) at j * n + r)
+                        for i in 0..16 {
+                            *sc.add(r + i) = quant_w_row(s.row(r + i), k, dst.add(i * k), tp.add(i * k));
+                        }
+                        let mut j = 0;
+                        while j < k {
+                            let mut x = [_mm_setzero_si128(); 16];
+                            for i in 0..16 {
+                                x[i] = _mm_loadu_si128(tp.add(i * k + j) as *const __m128i);
+                            }
+                            transpose16(&mut x);
+                            for c in 0..16 {
+                                _mm_storeu_si128(low.add((j + c) * n + r) as *mut __m128i, x[c]);
+                            }
+                            j += 16;
+                        }
+                        dst = dst.add(16 * k);
+                        r += 16;
+                    } else {
+                        *sc.add(r) = quant_w_row(s.row(r), k, dst, tp);
+                        let mut lp = low.add(r);
+                        for j in 0..k {
+                            *lp = *tp.add(j);
+                            lp = lp.add(n);
+                        }
+                        dst = dst.add(k);
+                        r += 1;
                     }
-                    dst = dst.add(s.k);
                 }
             }
+            _mm_sfence();
             std::ptr::write_bytes(arena[tid].get().add(size[tid]), 0, PAD);
         });
     }
@@ -1537,6 +1820,7 @@ fn main() {
     let mut logits_out: Option<String> = None;
     let mut prompt_file: Option<String> = None;
     let mut chat = false;
+    let mut stop = false;
     let mut n_gen: Option<usize> = None;
     let mut force: Option<String> = None;
     let mut tokens_out: Option<String> = None;
@@ -1568,6 +1852,12 @@ fn main() {
                 i += 1;
                 continue;
             }
+            // end the reply at the first end-of-turn / end-of-text token (it is the last token reported)
+            "--stop" => {
+                stop = true;
+                i += 1;
+                continue;
+            }
             other => {
                 eprintln!("unknown arg: {}", other);
                 std::process::exit(2)
@@ -1584,8 +1874,34 @@ fn main() {
     }
     let nt = nt.clamp(1, MAXT);
     let pool = Pool::new(nt);
+    // the tokenizer (2 MB of JSON) loads on its own thread while the weights are quantised
+    let tok_thread = if mode == "gen" {
+        let (pf, md) = (prompt_file.clone(), model_dir.clone());
+        Some(std::thread::spawn(move || {
+            let pf = pf.expect("--prompt-file required");
+            let text = String::from_utf8_lossy(&std::fs::read(&pf).unwrap_or_else(|e| {
+                eprintln!("cannot read {}: {}", pf, e);
+                std::process::exit(1)
+            }))
+            .into_owned();
+            let t_tok = std::time::Instant::now();
+            let tok = tokenizers::Tokenizer::from_file(format!("{}/tokenizer.json", md)).expect("tokenizer");
+            let full = if chat {
+                format!("<|im_start|>system\nYou are a helpful AI assistant named SmolLM, trained by Hugging Face<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n", text)
+            } else {
+                text
+            };
+            let enc = tok.encode(full.as_str(), false).expect("encode");
+            let prompt_ids: Vec<u32> = enc.get_ids().to_vec();
+            (tok, prompt_ids, t_tok.elapsed().as_secs_f64() * 1e3)
+        }))
+    } else {
+        None
+    };
     let t_load = std::time::Instant::now();
-    let model = load_model(&model_dir, &pool);
+    // greedy decoding without a logits file only needs the best row: the head gets its 4-bit plane
+    let fast_head = mode == "gen" && logits_out.is_none() && std::env::var("SMOL_HEAD").map(|v| v != "full").unwrap_or(true);
+    let model = load_model(&model_dir, &pool, fast_head);
     let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
 
     if mode == "ppl" {
@@ -1630,20 +1946,7 @@ fn main() {
     }
 
     // ---- gen
-    let pf = prompt_file.expect("--prompt-file required");
-    let text = String::from_utf8_lossy(&std::fs::read(&pf).unwrap_or_else(|e| {
-        eprintln!("cannot read {}: {}", pf, e);
-        std::process::exit(1)
-    }))
-    .into_owned();
-    let tok = tokenizers::Tokenizer::from_file(format!("{}/tokenizer.json", model_dir)).expect("tokenizer");
-    let full = if chat {
-        format!("<|im_start|>system\nYou are a helpful AI assistant named SmolLM, trained by Hugging Face<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n", text)
-    } else {
-        text
-    };
-    let enc = tok.encode(full.as_str(), false).expect("encode");
-    let prompt_ids: Vec<u32> = enc.get_ids().to_vec();
+    let (tok, prompt_ids, tok_ms) = tok_thread.unwrap().join().unwrap();
     let forced: Option<Vec<u32>> = force.map(|f| read_u32s(&f));
     let ngen = match &forced {
         Some(f) => f.len(),
@@ -1657,6 +1960,8 @@ fn main() {
     let mut nc = Caches::new(ctx_cap, if msz > 1 { plen } else { 0 });
     let mut b = Bufs::new(msz, ctx_cap, nt);
     let mut logits = vec![0f32; VV];
+    let mut ubuf = vec![0i32; VV + 8];
+    let mut cands: Vec<(u32, i32, f32)> = Vec::with_capacity(4096);
     let mut lf = logits_out.map(|p| std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(p).unwrap()));
     let mut generated: Vec<u32> = Vec::with_capacity(ngen);
     let mut off = 0;
@@ -1674,7 +1979,11 @@ fn main() {
     for j in 0..ngen {
         // the row that predicts token j: the prompt's last row, then each fed token's row
         let row = if j == 0 { m - 1 } else { 0 };
-        let cur = head_argmax(&pool, &model.head, b.xq[row * H..].as_ptr(), b.xs[row], logits.as_mut_ptr());
+        let fast = if fast_head { head_fast(&pool, &model.head, b.xq[row * H..].as_ptr(), b.xs[row], ubuf.as_mut_ptr(), &mut cands) } else { None };
+        let cur = match fast {
+            Some(c) => c,
+            None => head_argmax(&pool, &model.head, b.xq[row * H..].as_ptr(), b.xs[row], logits.as_mut_ptr()),
+        };
         tock(6, &mut t);
         if let Some(f) = &mut lf {
             f.write_all(as_bytes(&logits)).unwrap();
@@ -1684,6 +1993,9 @@ fn main() {
             None => cur,
         };
         generated.push(tk);
+        if stop && (tk == 0 || tk == 2) {
+            break;
+        }
         if j + 1 < ngen {
             embed_rows(&model, &[tk], &mut b.h);
             forward(&model, &pool, &mut nc, &mut b, 1);
@@ -1696,7 +2008,7 @@ fn main() {
     }
     // SMOL_STATS=1: one line on stderr with the time of each phase (model load, prompt, generated tokens)
     if std::env::var("SMOL_STATS").is_ok() {
-        eprintln!("SMOL_STATS load_ms={:.1} prompt_tokens={} prefill_ms={:.1} gen_tokens={} decode_ms={:.1}", load_ms, plen, pre_ms, ngen, dec_ms);
+        eprintln!("SMOL_STATS load_ms={:.1} prompt_tokens={} prefill_ms={:.1} gen_tokens={} decode_ms={:.1} tok_ms={:.1}", load_ms, plen, pre_ms, generated.len(), dec_ms, tok_ms);
     }
     if let Some(to) = tokens_out {
         let mut all = prompt_ids.clone();
@@ -1711,4 +2023,7 @@ fn main() {
     if !txt.ends_with('\n') {
         let _ = so.write_all(b"\n");
     }
+    let _ = so.flush();
+    // nothing left to save: skip unmapping the weights and tearing down the tokenizer
+    unsafe { _exit(0) }
 }

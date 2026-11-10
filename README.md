@@ -18,8 +18,9 @@ into `./model` (about 270 MB, skipped when already there), builds with `cargo bu
 Settings by environment variable: `PORT`, `HOST` (default `127.0.0.1`; the page has no login), `MODEL_DIR`,
 `HF_REPO`, `HF_ENDPOINT`, `HF_TOKEN`. Needs Linux x86-64 and a Rust toolchain; on Windows use WSL.
 
-Every message runs `smol gen` (a few rounds with a growing token limit until the model ends its turn), so a
-reply costs a fraction of a second of model loading plus generation at roughly 100-300 tokens per second.
+Every message is one `smol gen --stop` run (the engine stops by itself at the end-of-turn token), so a reply
+costs about 0.1 s of model and tokenizer loading plus generation at roughly 200 tokens per second on one core
+and 300+ on several.
 
 Under each reply the page prints its speed: prompt tokens and prefill tok/s, reply tokens and decode tok/s,
 model load time, total time (and how many engine runs it took), and the end-to-end rate (reply tokens over total
@@ -35,3 +36,14 @@ target/release/smol ppl --model model --tokens in.u32 --ctx 1024 --logits out.f3
 ```
 
 `gen` writes greedy tokens (ties to the lowest id); `--logits` and `--tokens-out` do not change the tokens.
+`--stop` ends the reply at the first end-of-turn or end-of-text token. `SMOL_NT=1` runs on one core.
+
+## What a single query pays for
+
+- Loading: the weight file is mapped (not copied) and quantised on the fly; the low-byte plane is transposed
+  16 rows at a time, skipped for the matrix that never uses it, and made row by row on first use for the head.
+  The tokenizer loads on its own thread meanwhile.
+- Decoding is bound by memory bandwidth (every token streams all the weights once), so the output head, a
+  fifth of those bytes, is read at 4 bits per weight when only the greedy token is wanted: that first pass
+  brackets every logit, and the few hundred rows that can still win are then computed exactly as before.
+  `--logits` and `ppl` always use the full head; `SMOL_HEAD=full` forces it for `gen` too.

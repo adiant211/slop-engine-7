@@ -179,55 +179,49 @@ fn generate(cfg: &Config, prompt: &[u8], max: usize) -> Result<Generated, String
     let file = tmp.join(format!("smol-ui-{}-{}.txt", std::process::id(), id));
     let toks = tmp.join(format!("smol-ui-{}-{}.tok", std::process::id(), id));
     std::fs::write(&file, prompt).map_err(|e| format!("cannot write prompt file: {}", e))?;
-    let mut n = 48.min(max);
-    let mut rounds = 0;
-    let result = loop {
-        rounds += 1;
+    // one engine run: it stops by itself at the end-of-turn token (--stop), or after `max` tokens
+    let rounds = 1;
+    let result = (|| {
         let out = Command::new(&cfg.engine)
             .args(["gen", "--model", &cfg.model, "--prompt-file"])
             .arg(&file)
-            .args(["--n", &n.to_string(), "--tokens-out"])
+            .args(["--stop", "--n", &max.to_string(), "--tokens-out"])
             .arg(&toks)
             .env("SMOL_STATS", "1")
-            .output();
-        let out = match out {
-            Ok(o) => o,
-            Err(e) => break Err(format!("cannot run the engine: {}", e)),
-        };
+            .output()
+            .map_err(|e| format!("cannot run the engine: {}", e))?;
         let err = String::from_utf8_lossy(&out.stderr).into_owned();
         if !out.status.success() {
-            break Err(format!("engine failed: {}", err.lines().last().unwrap_or("")));
+            return Err(format!("engine failed: {}", err.lines().last().unwrap_or("")));
         }
         let text = String::from_utf8_lossy(&out.stdout).into_owned();
         let stop = ["<|im_end|>", "<|endoftext|>"].iter().filter_map(|m| text.find(m)).min();
-        if stop.is_some() || n >= max {
-            let text = match stop {
-                Some(at) => text[..at].trim().to_string(),
-                None => text.trim_end().to_string(),
-            };
-            // token counts from the engine's token file: prompt followed by the n generated tokens
-            let ids: Vec<u32> = std::fs::read(&toks)
-                .unwrap_or_default()
-                .chunks_exact(4)
-                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect();
-            let plen = ids.len().saturating_sub(n);
-            let gen = ids[plen..].iter().position(|t| STOP_IDS.contains(t)).unwrap_or(n);
-            let line = err.lines().find(|l| l.starts_with("SMOL_STATS")).unwrap_or("");
-            break Ok(Generated {
-                text,
-                prompt: plen,
-                gen,
-                decode_tokens: n,
-                rounds,
-                load_ms: stat(line, "load_ms"),
-                prefill_ms: stat(line, "prefill_ms"),
-                decode_ms: stat(line, "decode_ms"),
-                total_ms: 0.0,
-            });
-        }
-        n = (n * 2).min(max);
-    };
+        let text = match stop {
+            Some(at) => text[..at].trim().to_string(),
+            None => text.trim_end().to_string(),
+        };
+        let line = err.lines().find(|l| l.starts_with("SMOL_STATS")).unwrap_or("");
+        // token counts from the engine: the prompt, then the tokens it decoded (the stop token last)
+        let (plen, n) = (stat(line, "prompt_tokens") as usize, stat(line, "gen_tokens") as usize);
+        let ids: Vec<u32> = std::fs::read(&toks)
+            .unwrap_or_default()
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let tail = &ids[ids.len().saturating_sub(n)..];
+        let gen = tail.iter().position(|t| STOP_IDS.contains(t)).unwrap_or(n);
+        Ok(Generated {
+            text,
+            prompt: plen,
+            gen,
+            decode_tokens: n,
+            rounds,
+            load_ms: stat(line, "load_ms"),
+            prefill_ms: stat(line, "prefill_ms"),
+            decode_ms: stat(line, "decode_ms"),
+            total_ms: 0.0,
+        })
+    })();
     let _ = std::fs::remove_file(&file);
     let _ = std::fs::remove_file(&toks);
     result.map(|mut g| {
